@@ -8,6 +8,8 @@
 mod boot;
 mod cart;
 mod cp15;
+mod dma;
+pub mod gpu;
 mod hle_bios;
 mod hle_swi;
 mod ipc;
@@ -24,6 +26,8 @@ mod tests;
 pub use boot::BootError;
 pub use cart::{crc16, CartError, Header};
 pub use cp15::Cp15;
+pub use dma::{Dma, Trigger};
+pub use gpu::Gpu;
 pub use hle_bios::{BIOS7 as HLE_BIOS7, BIOS9 as HLE_BIOS9};
 pub use irq::{bits as irq_bits, IrqController};
 pub use ipc::IpcFifo;
@@ -89,6 +93,11 @@ pub struct Hardware {
     /// Timers de l'ARM9 (indice 0) et de l'ARM7 (indice 1).
     pub timers: [Timers; 2],
     pub fifo: IpcFifo,
+    pub gpu: Gpu,
+    /// DMA de l'ARM9 (indice 0) et de l'ARM7 (indice 1).
+    pub dma: [Dma; 2],
+    /// Fonctions hors GPU demandées mais pas encore émulées (DMA spéciales…).
+    pub unsupported: BTreeSet<&'static str>,
     /// Instant courant, en cycles ARM9, vu par le CPU qui accède au bus.
     pub now: u64,
 
@@ -141,6 +150,9 @@ impl Default for Hardware {
             lcd: Lcd::default(),
             timers: [Timers::default(), Timers::default()],
             fifo: IpcFifo::default(),
+            gpu: Gpu::default(),
+            dma: [Dma::new(true), Dma::new(false)],
+            unsupported: BTreeSet::new(),
             now: 0,
             arm7_halt_request: false,
             unhandled_io: BTreeSet::new(),
@@ -230,6 +242,43 @@ impl Hardware {
         }
     }
 
+    /// Lance le transfert DMA `n` du CPU `cpu`.
+    fn run_dma(&mut self, cpu: usize, n: usize) {
+        let ch = self.dma[cpu].ch[n];
+        let count = self.dma[cpu].count(n);
+        let trigger = self.dma[cpu].trigger_of(n);
+        let step: i32 = if ch.word() { 4 } else { 2 };
+        let delta = |mode: u32| match mode {
+            0 | 3 => step, // 3 : interdit pour la source, traité comme 0
+            1 => -step,
+            _ => 0,
+        };
+        let (ds, dd) = (delta(ch.src_mode()), delta(ch.dst_mode()));
+        let (s, d) = if cpu == 0 {
+            dma_transfer(&mut Arm9Bus { hw: self }, ch.word(), count, ch.src, ch.dst, ds, dd)
+        } else {
+            dma_transfer(&mut Arm7Bus { hw: self }, ch.word(), count, ch.src, ch.dst, ds, dd)
+        };
+        let c = &mut self.dma[cpu].ch[n];
+        c.src = s;
+        c.dst = if ch.dst_mode() == 3 { c.dad & 0x0FFF_FFFF } else { d };
+        if !ch.repeat() || trigger == Trigger::Immediate {
+            c.cnt &= !(1 << 31);
+        }
+        if ch.irq() {
+            self.irq(cpu).request(irq_bits::DMA0 << n);
+        }
+    }
+
+    /// Lance les canaux DMA en attente de `trigger`.
+    fn trigger_dma(&mut self, cpu: usize, trigger: Trigger) {
+        for n in 0..4 {
+            if self.dma[cpu].ch[n].enabled() && self.dma[cpu].trigger_of(n) == trigger {
+                self.run_dma(cpu, n);
+            }
+        }
+    }
+
     /// Exécute un événement arrivé à échéance.
     fn handle_event(&mut self, ev: Event, time: u64) {
         self.now = time;
@@ -237,10 +286,21 @@ impl Hardware {
             Event::HBlank => {
                 let irqs = self.lcd.hblank();
                 self.raise(irqs);
+                let y = self.lcd.vcount as usize;
+                if y < gpu::HEIGHT {
+                    let ctx = gpu::RenderCtx { vram: &self.vram, palette: &self.palette, powcnt1: self.powcnt1 };
+                    self.gpu.render_line(y, &ctx);
+                    self.trigger_dma(0, Trigger::HBlank);
+                }
             }
             Event::LineEnd => {
                 let irqs = self.lcd.next_line(time);
                 self.raise(irqs);
+                if self.lcd.vcount == lcd::VISIBLE_LINES {
+                    self.gpu.start_frame();
+                    self.trigger_dma(0, Trigger::VBlank);
+                    self.trigger_dma(1, Trigger::VBlank);
+                }
                 self.sched.schedule(Event::HBlank, time + lcd::HBLANK_START);
                 self.sched.schedule(Event::LineEnd, time + LINE_CYCLES);
             }
@@ -249,6 +309,9 @@ impl Hardware {
     }
 
     fn io_common_read(&mut self, cpu: usize, addr: u32) -> Option<u32> {
+        if let Some(v) = self.dma[cpu].read(addr) {
+            return Some(v);
+        }
         Some(match addr {
             0x0400_0004 => self.lcd.read_dispstat(cpu) as u32 | (self.lcd.vcount as u32) << 16,
             0x0400_0100..=0x0400_010C => self.timer_read(cpu, ((addr >> 2) & 3) as usize),
@@ -263,6 +326,18 @@ impl Hardware {
     }
 
     fn io_common_write(&mut self, cpu: usize, addr: u32, val: u32, mask: u32) -> bool {
+        if let Some(start) = self.dma[cpu].write(addr, val, mask) {
+            let n = ((addr.wrapping_sub(0x0400_00B0)) / 12) as usize;
+            if n < 4 && self.dma[cpu].ch[n].enabled() {
+                if let Trigger::Other(_) = self.dma[cpu].trigger_of(n) {
+                    self.unsupported.insert("DMA sur un déclencheur autre que immédiat/VBlank/HBlank");
+                }
+            }
+            if let Some(n) = start {
+                self.run_dma(cpu, n);
+            }
+            return true;
+        }
         match addr {
             0x0400_0004 => self.lcd.write_dispstat(cpu, val as u16, mask as u16),
             0x0400_0100..=0x0400_010C => self.timer_write(cpu, ((addr >> 2) & 3) as usize, val, mask),
@@ -310,6 +385,22 @@ enum Target<'a> {
     Io,
     /// Rien à cette adresse : lecture à 0, écriture ignorée.
     Open,
+}
+
+/// Copie DMA élémentaire, à travers la vue du CPU concerné.
+fn dma_transfer<B: Bus>(bus: &mut B, word: bool, count: u32, mut s: u32, mut d: u32, ds: i32, dd: i32) -> (u32, u32) {
+    for _ in 0..count {
+        if word {
+            let v = bus.read32(s & !3);
+            bus.write32(d & !3, v);
+        } else {
+            let v = bus.read16(s & !1);
+            bus.write16(d & !1, v);
+        }
+        s = s.wrapping_add(ds as u32);
+        d = d.wrapping_add(dd as u32);
+    }
+    (s, d)
 }
 
 /// Masque de 32 bits couvrant un accès de `size` octets à `addr`.
@@ -376,6 +467,9 @@ impl Arm9Bus<'_> {
         if let Some(v) = hw.io_common_read(0, addr) {
             return v;
         }
+        if let Some(v) = hw.gpu.io_read(addr) {
+            return v;
+        }
         match addr {
             0x0400_0130 => hw.keyinput as u32,
             0x0400_0180 => ((hw.ipcsync9 & 0x4F00) | ((hw.ipcsync7 >> 8) & 0xF)) as u32,
@@ -397,7 +491,7 @@ impl Arm9Bus<'_> {
 
     fn io_write(&mut self, addr: u32, val: u32, mask: u32) {
         let hw = &mut *self.hw;
-        if hw.io_common_write(0, addr, val, mask) {
+        if hw.io_common_write(0, addr, val, mask) || hw.gpu.io_write(addr, val, mask) {
             return;
         }
         match addr {

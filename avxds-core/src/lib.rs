@@ -17,6 +17,7 @@
 pub mod bus;
 pub mod cpu;
 pub mod nds;
+pub mod png;
 
 pub use bus::{Bus, Cp15Op};
 pub use cpu::{Arch, Arm7, Arm9, Armv4t, Armv5te, Cpu, Mode};

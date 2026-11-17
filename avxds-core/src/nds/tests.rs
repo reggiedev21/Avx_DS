@@ -364,10 +364,10 @@ fn hardware_square_root() {
 #[test]
 fn unhandled_io_is_recorded() {
     let mut nds = Nds::new();
-    nds.bus9().read32(0x0400_00B0); // DMA0SAD : pas encore émulé
-    nds.bus7().write16(0x0400_0504, 0x200);
+    nds.bus9().read32(0x0400_0FF0); // adresse qui n'existe pas sur DS
+    nds.bus7().write16(0x0400_0FF4, 0x200);
     let seen: Vec<_> = nds.hw.unhandled_io.iter().copied().collect();
-    assert_eq!(seen, [(CpuId::Arm9, 0x0400_00B0), (CpuId::Arm7, 0x0400_0504)]);
+    assert_eq!(seen, [(CpuId::Arm9, 0x0400_0FF0), (CpuId::Arm7, 0x0400_0FF4)]);
 }
 
 // ======================================================================
@@ -712,4 +712,267 @@ fn header_fields() {
     assert_eq!((h.arm9_entry, h.arm7_ram_address), (0x0200_0800, 0x0238_0000));
     rom[0x38..0x3C].copy_from_slice(&0x0600_0000u32.to_le_bytes());
     assert!(matches!(Header::parse(&rom), Err(CartError::BadLoadAddress("ARM7", _, _))));
+}
+
+// ======================================================================
+// GPU : moteurs 2D
+// ======================================================================
+
+const RED: u16 = 0x001F;
+const GREEN: u16 = 0x03E0;
+const BLUE: u16 = 0x7C00;
+
+/// Machine sans CPU actif, écrans allumés, moteur A en haut.
+fn gpu_nds() -> Nds {
+    let mut nds = idle_nds();
+    nds.bus9().write16(0x0400_0304, 0x8203);
+    nds
+}
+
+fn pixel(nds: &Nds, screen: usize, x: usize, y: usize) -> u32 {
+    nds.hw.gpu.screen(screen)[y * gpu::WIDTH + x]
+}
+
+fn rgb(c: u16) -> u32 {
+    gpu::rgb555_to_rgb888(c)
+}
+
+#[test]
+fn rgb555_conversion() {
+    assert_eq!(rgb(RED), 0xFF0000);
+    assert_eq!(rgb(GREEN), 0x00FF00);
+    assert_eq!(rgb(0x7FFF), 0xFFFFFF);
+    assert_eq!(rgb(0x0010), 0x840000, "16 → 0x84 (bits recopiés)");
+}
+
+#[test]
+fn vram_display_mode() {
+    let mut nds = gpu_nds();
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0240, 0x80); // A en LCDC
+        bus.write32(0x0400_0000, 0x0002_0000); // mode 2 : affichage VRAM, banque A
+        bus.write16(0x0680_0000 + (5 * 256 + 10) * 2, RED);
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 5), 0xFF0000);
+    assert_eq!(pixel(&nds, 0, 11, 5), 0);
+    assert_eq!(pixel(&nds, 1, 0, 0), 0xFFFFFF, "moteur B éteint : blanc");
+}
+
+#[test]
+fn screens_swap_with_powcnt1() {
+    let mut nds = gpu_nds();
+    nds.bus9().write8(0x0400_0240, 0x80);
+    nds.bus9().write32(0x0400_0000, 0x0002_0000);
+    nds.bus9().write16(0x0680_0000, RED);
+    nds.bus9().write16(0x0400_0304, 0x0203); // bit 15 = 0 : moteur A en bas
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), 0xFF0000);
+    assert_eq!(pixel(&nds, 0, 0, 0), 0xFFFFFF);
+}
+
+/// Moteur B, BG0 en tuiles 4 bits : tuile 1 = pixels 1, 2, 0, 0… sur sa
+/// première ligne. Carte en 0x1000, tuiles en 0x0000 (banque C en fond B).
+fn text_setup(nds: &mut Nds) {
+    let mut bus = nds.bus9();
+    bus.write8(0x0400_0242, 0x84); // C → fond du moteur B
+    bus.write32(0x0400_1000, 0x0001_0100); // mode 0, BG0
+    bus.write16(0x0400_1008, 2 << 8); // BG0CNT : écran en 2 × 2 Ko
+    bus.write16(0x0620_0020, 0x0021); // tuile 1, ligne 0 : idx 1, 2, 0, 0
+    bus.write16(0x0620_1000, 0x0001); // carte (0,0) : tuile 1
+    bus.write16(0x0620_1002, 0x0401); // carte (1,0) : tuile 1, miroir horizontal
+    bus.write16(0x0500_0400, BLUE); // couleur de fond
+    bus.write16(0x0500_0402, RED);
+    bus.write16(0x0500_0404, GREEN);
+}
+
+#[test]
+fn text_background_4bpp_with_flip_and_scroll() {
+    let mut nds = gpu_nds();
+    text_setup(&mut nds);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(RED));
+    assert_eq!(pixel(&nds, 1, 1, 0), rgb(GREEN));
+    assert_eq!(pixel(&nds, 1, 2, 0), rgb(BLUE), "index 0 transparent");
+    assert_eq!(pixel(&nds, 1, 15, 0), rgb(RED), "tuile retournée");
+    assert_eq!(pixel(&nds, 1, 14, 0), rgb(GREEN));
+    assert_eq!(pixel(&nds, 1, 0, 1), rgb(BLUE), "ligne 1 de la tuile vide");
+
+    nds.bus9().write16(0x0400_1010, 1); // BG0HOFS = 1
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(GREEN), "défilement horizontal");
+}
+
+#[test]
+fn background_priorities() {
+    let mut nds = gpu_nds();
+    text_setup(&mut nds);
+    {
+        let mut bus = nds.bus9();
+        // BG1 : mêmes tuiles, carte en 0x1800, palette 1 (index 1 = vert).
+        bus.write16(0x0400_100A, 3 << 8);
+        bus.write16(0x0620_1800, 0x1001);
+        bus.write16(0x0500_0422, GREEN);
+        bus.write32(0x0400_1000, 0x0001_0300); // BG0 + BG1
+        bus.write16(0x0400_1008, (2 << 8) | 1); // BG0 priorité 1
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(GREEN), "BG1 (priorité 0) devant");
+    nds.bus9().write16(0x0400_1008, 2 << 8); // BG0 priorité 0 aussi
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(RED), "à égalité, le plus petit numéro gagne");
+}
+
+#[test]
+fn extended_direct_bitmap_with_affine_zoom() {
+    let mut nds = gpu_nds();
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0240, 0x81); // A → fond du moteur A
+        bus.write32(0x0400_0000, 0x0001_0405); // mode 5, BG2
+        bus.write16(0x0400_000C, 0x4084); // BG2 : bitmap direct 256×256
+        bus.write32(0x0400_0020, 0x0000_0080); // PA = 0,5 (zoom ×2), PB = 0
+        bus.write32(0x0400_0024, 0x0100_0000); // PC = 0, PD = 1
+        bus.write16(0x0600_0000, RED | 0x8000);
+        bus.write16(0x0600_0002, GREEN | 0x8000);
+        bus.write16(0x0600_0004, BLUE); // bit 15 à 0 : transparent
+        bus.write16(0x0600_0200, GREEN | 0x8000); // ligne 1
+        bus.write16(0x0500_0000, 0x7FFF); // couleur de fond : blanc
+    }
+    nds.run_frame();
+    let line0: Vec<u32> = (0..6).map(|x| pixel(&nds, 0, x, 0)).collect();
+    assert_eq!(line0, [rgb(RED), rgb(RED), rgb(GREEN), rgb(GREEN), 0xFFFFFF, 0xFFFFFF]);
+    assert_eq!(pixel(&nds, 0, 0, 1), rgb(GREEN), "PD fait avancer d'une ligne");
+}
+
+#[test]
+fn bitmap_256_colors_and_affine_reference_point() {
+    let mut nds = gpu_nds();
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0240, 0x81);
+        bus.write32(0x0400_0000, 0x0001_0805); // mode 5, BG3
+        bus.write16(0x0400_000E, 0x4080); // BG3 : bitmap 256 couleurs 256×256
+        bus.write32(0x0400_0030, 0x0000_0100); // PA = 1
+        bus.write32(0x0400_0034, 0x0100_0000); // PD = 1
+        bus.write32(0x0400_0038, 3 << 8); // BG3X = 3 : décalage de 3 pixels
+        bus.write16(0x0600_0002, 0x0700); // pixel (3,0) = index 7
+        bus.write16(0x0500_000E, BLUE);
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(BLUE));
+}
+
+#[test]
+fn master_brightness_and_forced_blank() {
+    let mut nds = gpu_nds();
+    text_setup(&mut nds);
+    nds.bus9().write16(0x0400_106C, (2 << 14) | 16); // assombrissement total
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), 0);
+    nds.bus9().write16(0x0400_106C, (1 << 14) | 8); // éclaircissement de moitié
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(0x001F | (15 << 5) | (15 << 10)));
+    nds.bus9().write16(0x0400_106C, 0);
+    nds.bus9().write32(0x0400_1000, 0x0001_0180); // « forced blank »
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), 0xFFFFFF);
+}
+
+#[test]
+fn unsupported_features_are_noted() {
+    let mut nds = gpu_nds();
+    nds.bus9().write32(0x0400_0000, 0x0001_1108); // BG0 en 3D + sprites
+    nds.run_frame();
+    let notes = &nds.hw.gpu.unsupported;
+    assert!(notes.contains("3D (BG0)") && notes.contains("sprites (OBJ)"), "{notes:?}");
+}
+
+// ======================================================================
+// DMA
+// ======================================================================
+
+fn dma(nds: &mut Nds, cpu: CpuId, n: u32, sad: u32, dad: u32, cnt: u32) {
+    let base = 0x0400_00B0 + 12 * n;
+    match cpu {
+        CpuId::Arm9 => {
+            let mut bus = nds.bus9();
+            bus.write32(base, sad);
+            bus.write32(base + 4, dad);
+            bus.write32(base + 8, cnt);
+        }
+        CpuId::Arm7 => {
+            let mut bus = nds.bus7();
+            bus.write32(base, sad);
+            bus.write32(base + 4, dad);
+            bus.write32(base + 8, cnt);
+        }
+    }
+}
+
+const DMA_ON: u32 = 1 << 31;
+const DMA_32: u32 = 1 << 26;
+
+#[test]
+fn dma_immediate_copy_and_fill() {
+    let mut nds = Nds::new();
+    for i in 0..8u32 {
+        nds.bus9().write32(0x0200_0000 + 4 * i, i + 1);
+    }
+    dma(&mut nds, CpuId::Arm9, 3, 0x0200_0000, 0x0200_1000, DMA_ON | DMA_32 | 8);
+    assert_eq!(nds.bus9().read32(0x0200_101C), 8);
+    assert_eq!(nds.bus9().read32(0x0400_00D4 + 4) & DMA_ON, 0, "désactivé après un transfert immédiat");
+
+    // Remplissage 16 bits (source fixe), destination décroissante.
+    dma(&mut nds, CpuId::Arm9, 0, 0x0200_0000, 0x0200_2006, DMA_ON | (2 << 23) | (1 << 21) | 4);
+    let got: Vec<u16> = (0..4).map(|i| nds.bus9().read16(0x0200_2000 + 2 * i)).collect();
+    assert_eq!(got, [1, 1, 1, 1]);
+    assert_eq!(nds.bus9().read16(0x0200_1FFE), 0, "pas un mot de trop");
+}
+
+#[test]
+fn dma_through_cpu_view_and_irq() {
+    let mut nds = Nds::new();
+    nds.bus7().write32(0x0380_0000, 0xCAFE);
+    // L'ARM7 copie de sa WRAM vers la Main RAM, avec IRQ de fin.
+    dma(&mut nds, CpuId::Arm7, 1, 0x0380_0000, 0x0200_0000, DMA_ON | DMA_32 | (1 << 30) | 1);
+    assert_eq!(nds.bus9().read32(0x0200_0000), 0xCAFE);
+    assert_eq!(nds.hw.irq7.if_, irq_bits::DMA1);
+    assert_eq!(nds.hw.dma[1].count(1), 1);
+    nds.hw.dma[1].ch[0].cnt = 0;
+    assert_eq!(nds.hw.dma[1].count(0), 0x4000, "0 = maximum (ARM7 canaux 0–2)");
+}
+
+#[test]
+fn dma_vblank_fires_once() {
+    let mut nds = idle_nds();
+    nds.bus9().write32(0x0200_0000, 0x1234);
+    dma(&mut nds, CpuId::Arm9, 1, 0x0200_0000, 0x0200_0100, DMA_ON | DMA_32 | (1 << 27) | 1);
+    assert_eq!(nds.bus9().read32(0x0200_0100), 0, "attend le VBlank");
+    nds.run_frame();
+    assert_eq!(nds.bus9().read32(0x0200_0100), 0x1234);
+    assert_eq!(nds.hw.dma[0].ch[1].cnt & DMA_ON, 0);
+}
+
+#[test]
+fn hblank_dma_changes_backdrop_every_line() {
+    let mut nds = gpu_nds();
+    {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_1000, 0x0001_0000); // moteur B : graphique, aucun fond
+        bus.write16(0x0500_0400, 0x7FFF);
+        for y in 0..192u32 {
+            bus.write16(0x0200_0000 + 2 * y, y as u16);
+        }
+    }
+    nds.run_frame(); // on démarre au VBlank
+    // Une couleur par HBlank, destination fixe, répétition.
+    dma(&mut nds, CpuId::Arm9, 0, 0x0200_0000, 0x0500_0400, DMA_ON | (1 << 25) | (2 << 27) | (2 << 21) | 1);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), 0xFFFFFF, "ligne 0 : couleur d'avant");
+    for y in [1usize, 2, 100, 191] {
+        assert_eq!(pixel(&nds, 1, 0, y), rgb((y - 1) as u16), "ligne {y}");
+    }
+    assert_ne!(nds.hw.dma[0].ch[0].cnt & DMA_ON, 0, "toujours actif (répétition)");
 }
