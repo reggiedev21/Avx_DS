@@ -1,0 +1,13 @@
+[package]
+name = "avxds-core"
+version = "0.1.0"
+edition = "2021"
+description = "Cœur de l'émulateur Nintendo DS AvxDS"
+license = "GPL-2.0-or-later"
+authors = ["Yassine Mahroug"]
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"

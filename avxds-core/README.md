@@ -1,0 +1,85 @@
+# avxds-core
+
+Cœur de l'émulateur Nintendo DS **AvxDS**, réécrit de zéro en novembre 2026.
+
+Pour l'instant, cette crate contient les deux processeurs de la DS, émulés par un
+seul interpréteur générique :
+
+| Type    | Processeur | Architecture | Spécificités gérées |
+|---------|------------|--------------|---------------------|
+| `Arm9`  | ARM946E-S  | ARMv5TE      | BLX, CLZ, QADD/QSUB/QDADD/QDSUB, SMLAxy/SMULxy/SMLAWy/SMLALxy, LDRD/STRD, PLD, BKPT, MRC/MCR p15, interworking sur LDR/LDM/POP |
+| `Arm7`  | ARM7TDMI   | ARMv4T       | Pas de CP15, condition NV = jamais, LDRH/LDRSH impairs, writeback LDM/STM de l'ARMv4 |
+
+Pas de `unsafe` (`#![forbid(unsafe_code)]`), pas de pointeurs bruts, pas de
+`static mut`, aucune dépendance.
+
+## Utilisation
+
+```rust
+use avxds_core::{Arm9, Bus};
+
+fn demarrer(bus: &mut impl Bus) {
+    let mut cpu = Arm9::new();
+    cpu.reset(bus);          // PC = vecteur de reset du bus
+    loop {
+        cpu.step(bus);       // une instruction (ou une IRQ si irq_line)
+    }
+}
+```
+
+La machine implémente le trait [`Bus`](src/bus.rs) : lectures/écritures 8/16/32
+bits (toujours alignées, les rotations sont faites par le CPU), base des vecteurs
+d'exception, CP15, et un point d'accroche `hle_swi` pour émuler les appels BIOS
+sans BIOS.
+
+## Structure
+
+```
+src/bus.rs          trait Bus, Cp15Op
+src/cpu/mod.rs      registres, modes et banques, exceptions, boucle step()
+src/cpu/alu.rs      additions avec retenue, barrel shifter, conditions
+src/cpu/arm.rs      jeu ARM, décodage par table de 4096 entrées (const fn)
+src/cpu/thumb.rs    jeu Thumb, décodage par table de 1024 entrées
+src/cpu/tests.rs    39 tests unitaires, instruction par instruction
+tests/programs.rs   tests d'intégration : programmes C réels
+tests/programs/     suite.c + binaires compilés + valeurs attendues
+examples/bench.rs   débit de l'interpréteur
+tools/asm.py        réassemble les blocs `// asm:` des tests unitaires
+tools/build_programs.sh   recompile les programmes de test
+```
+
+## Tests
+
+```
+cargo test
+cargo run --release --example bench
+```
+
+* **Tests unitaires** : chaque bloc de code est écrit en assembleur dans les
+  commentaires (`0xE1A0000F, // mov r0, pc`). Après modification d'un
+  commentaire : `python3 tools/asm.py src/cpu/tests.rs` (nécessite `llvm-mc`,
+  `ld.lld` et `llvm-objdump`).
+* **Tests d'intégration** : `tests/programs/suite.c` (tri, CRC32, division
+  logicielle, `switch` en table de sauts, récursion, multiplications 64 bits,
+  pointeurs de fonction, accès 8/16 bits signés, appels ARM ↔ Thumb…) est
+  compilé en 8 variantes : ARMv4T/ARMv5TE × ARM/Thumb × -O0/-O2. Les valeurs
+  attendues viennent du même code compilé sur la machine hôte (vérifié sous
+  UBSan). Pour régénérer : `sh tools/build_programs.sh` (clang + lld).
+
+Les binaires sont versionnés : `cargo test` n'a besoin d'aucun outil LLVM.
+
+## Limites connues
+
+* Timing : `step()` renvoie un nombre de cycles **approximatif**. Les vrais
+  timings (attente mémoire, cache de l'ARM9) viendront avec le scheduler.
+* Aucun matériel DS ici pour l'instant : mémoire, IRQ, IPC, timers, DMA et
+  affichage arrivent dans les étapes suivantes.
+
+## Prochaines étapes
+
+1. `Nds` : mémoire (Main RAM, WRAM partagée et propre à l'ARM7, TCM via CP15),
+   deux contrôleurs d'IRQ, IPCSYNC/FIFO, timers.
+2. Direct boot d'un `.nds` + HLE des SWI.
+3. Affichage en mode framebuffer VRAM (DISPCNT mode 2) : `test_triangle.nds`,
+   puis `mandel.nds`.
+4. ROMs de test CPU (armwrestler, rockwrestler) en plus de cette suite.

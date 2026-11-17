@@ -1,0 +1,21 @@
+// Généré par tools/build_programs.sh : ne pas éditer.
+pub const EXPECTED: [u32; 18] = [
+    0xB11924E1,
+    0x0000063D,
+    0xACDB49DE,
+    0xD70DA67C,
+    0x5172F414,
+    0x0A493F9C,
+    0x7A8ABCF6,
+    0x38110013,
+    0xC6CAFC1F,
+    0xF78CA5B5,
+    0x2810A7B9,
+    0x00576BA1,
+    0x4DB74F97,
+    0x194F21E8,
+    0x1C759EB2,
+    0x00000009,
+    0xFFFFF490,
+    0x600DC0DE,
+];
