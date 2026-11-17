@@ -2,8 +2,8 @@
 
 Cœur de l'émulateur Nintendo DS **AvxDS**, réécrit de zéro en novembre 2026.
 
-Pour l'instant, cette crate contient les deux processeurs de la DS, émulés par un
-seul interpréteur générique :
+Cette crate contient les deux processeurs de la DS (un seul interpréteur
+générique) et la machine qui les relie (`Nds`) :
 
 | Type    | Processeur | Architecture | Spécificités gérées |
 |---------|------------|--------------|---------------------|
@@ -41,6 +41,12 @@ src/cpu/alu.rs      additions avec retenue, barrel shifter, conditions
 src/cpu/arm.rs      jeu ARM, décodage par table de 4096 entrées (const fn)
 src/cpu/thumb.rs    jeu Thumb, décodage par table de 1024 entrées
 src/cpu/tests.rs    39 tests unitaires, instruction par instruction
+src/nds/mod.rs      struct Nds, matériel, vues Arm9Bus / Arm7Bus, registres I/O
+src/nds/cp15.rs     CP15 : contrôle, ITCM/DTCM, registres d'identification
+src/nds/vram.rs     banques A–I, VRAMCNT, zones BG/OBJ/LCDC/ARM7
+src/nds/irq.rs      contrôleur IME/IE/IF (un par CPU)
+src/nds/math.rs     division et racine carrée matérielles
+src/nds/tests.rs    21 tests de la machine
 tests/programs.rs   tests d'intégration : programmes C réels
 tests/programs/     suite.c + binaires compilés + valeurs attendues
 examples/bench.rs   débit de l'interpréteur
@@ -68,17 +74,45 @@ cargo run --release --example bench
 
 Les binaires sont versionnés : `cargo test` n'a besoin d'aucun outil LLVM.
 
+## La machine `Nds`
+
+```rust
+use avxds_core::Nds;
+let mut nds = Nds::new();
+nds.load_bios9(&bios9);   // facultatif : le BIOS maison ou un stub
+nds.reset();
+loop { nds.step(); }      // une instruction ARM9 + la part de l'ARM7
+```
+
+Déjà émulé :
+
+| Partie | Détail |
+|---|---|
+| Mémoire | Main RAM 4 Mo (miroirs), WRAM partagée selon WRAMCNT, WRAM ARM7 64 Ko, palette, OAM, BIOS en lecture seule |
+| CP15 | Registre de contrôle (vecteurs hauts), ITCM/DTCM avec taille virtuelle, base et mode « load », ID |
+| VRAM | 9 banques, tous les modes MST/OFS, chevauchements (OU en lecture), C/D pour l'ARM7, VRAMSTAT |
+| IRQ | IME/IE/IF séparés pour chaque CPU, réveil du Halt même avec IME = 0 |
+| IPC | IPCSYNC dans les deux sens, IRQ de synchronisation |
+| Divers | DIVCNT/SQRTCNT, KEYINPUT/EXTKEYIN (touches relâchées), POWCNT, POSTFLG, HALTCNT |
+
+Les registres I/O pas encore émulés sont notés dans `nds.hw.unhandled_io`
+(CPU et adresse) : c'est la liste de ce qu'il reste à faire pour un jeu donné.
+
 ## Limites connues
 
 * Timing : `step()` renvoie un nombre de cycles **approximatif**. Les vrais
   timings (attente mémoire, cache de l'ARM9) viendront avec le scheduler.
-* Aucun matériel DS ici pour l'instant : mémoire, IRQ, IPC, timers, DMA et
-  affichage arrivent dans les étapes suivantes.
+* Ordonnancement provisoire : `Nds::step()` fait avancer l'ARM7 à mi-vitesse
+  par dette de cycles. Le scheduler par événements le remplacera.
+* Pas encore : affichage, timers, DMA, IPCFIFO, cartouche, SPI, son, RTC.
+* Simplifications : division instantanée (pas de drapeau « occupé »), MPU et
+  caches mémorisés sans effet, protection en lecture du BIOS ARM7 absente,
+  slot GBA vide lu à 0, HALTCNT ne gère que le mode Halt.
 
 ## Prochaines étapes
 
-1. `Nds` : mémoire (Main RAM, WRAM partagée et propre à l'ARM7, TCM via CP15),
-   deux contrôleurs d'IRQ, IPCSYNC/FIFO, timers.
+1. Scheduler par événements, timing de l'écran (DISPSTAT, VCOUNT, IRQ
+   VBlank/HBlank), timers, IPCFIFO.
 2. Direct boot d'un `.nds` + HLE des SWI.
 3. Affichage en mode framebuffer VRAM (DISPCNT mode 2) : `test_triangle.nds`,
    puis `mandel.nds`.
