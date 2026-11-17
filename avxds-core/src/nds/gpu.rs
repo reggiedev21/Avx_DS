@@ -6,8 +6,10 @@
 //! 256 couleurs, bitmap direct), grand bitmap (mode 6), priorités, couleur
 //! de fond, master brightness, échange des écrans (POWCNT1 bit 15).
 //!
-//! Pas encore : sprites (OBJ), fenêtres, mélange (alpha), mosaïque,
-//! palettes étendues, 3D, capture. Leur emploi est noté dans
+//! Sprites (normaux, affines, bitmap), fenêtres (WIN0, WIN1, OBJ) et
+//! mélange (alpha, éclaircir, assombrir, sprites semi-transparents).
+//!
+//! Pas encore : mosaïque, palettes étendues, 3D, capture. Leur emploi est noté dans
 //! [`Gpu::unsupported`].
 
 use super::vram::{Region, Vram};
@@ -169,6 +171,7 @@ impl Default for Gpu {
 pub struct RenderCtx<'a> {
     pub vram: &'a Vram,
     pub palette: &'a [u8],
+    pub oam: &'a [u8],
     pub powcnt1: u16,
 }
 
@@ -262,30 +265,18 @@ impl Gpu {
             let o = pal_base + i * 2;
             u16::from_le_bytes([ctx.palette[o], ctx.palette[o + 1]]) & 0x7FFF
         };
-
         let mut notes: Vec<&'static str> = Vec::new();
-        if dispcnt & (1 << 12) != 0 {
-            notes.push("sprites (OBJ)");
-        }
-        if dispcnt & 0xE000 != 0 {
-            notes.push("fenêtres");
-        }
-        if (eng.regs[0x50 / 4] >> 6) & 3 != 0 {
-            notes.push("mélange (BLDCNT)");
-        }
         if dispcnt & (1 << 30) != 0 {
             notes.push("palettes étendues de fonds");
         }
 
-        let backdrop = pal(0);
-        *line = [backdrop; WIDTH];
-        let mut best_prio = [4u8; WIDTH];
-        let mut layer = [None::<u16>; WIDTH];
-
-        // Ordre d'affichage : priorité (0 = devant), puis numéro de fond.
-        let mut order: Vec<usize> = (0..4).filter(|&bg| dispcnt & (1 << (8 + bg)) != 0).collect();
-        order.sort_by_key(|&bg| (eng.bgcnt(bg) & 3, bg));
-        for bg in order.into_iter().rev() {
+        // 1. Chaque fond actif dessine sa ligne.
+        let mut bgs = [[None::<u16>; WIDTH]; 4];
+        let mut bg_on = [false; 4];
+        for bg in 0..4 {
+            if dispcnt & (1 << (8 + bg)) == 0 {
+                continue;
+            }
             let Some(kind) = eng.bg_kind(bg) else { continue };
             if bg == 0 && eng.is_a && dispcnt & 8 != 0 {
                 notes.push("3D (BG0)");
@@ -294,21 +285,95 @@ impl Gpu {
             if eng.bgcnt(bg) & 0x40 != 0 {
                 notes.push("mosaïque");
             }
-            layer.fill(None);
             match kind {
-                BgKind::Text => self.engines[e].text_line(bg, y, ctx.vram, region, &pal, &mut layer),
-                BgKind::Affine | BgKind::Extended | BgKind::LargeBitmap => {
-                    self.engines[e].affine_line(bg, kind, ctx.vram, region, &pal, &mut layer)
+                BgKind::Text => eng.text_line(bg, y, ctx.vram, region, &pal, &mut bgs[bg]),
+                _ => eng.affine_line(bg, kind, ctx.vram, region, &pal, &mut bgs[bg]),
+            }
+            bg_on[bg] = true;
+        }
+
+        // 2. Les sprites.
+        let mut obj = [ObjPixel::NONE; WIDTH];
+        if dispcnt & (1 << 12) != 0 {
+            eng.obj_line(y, ctx, &mut obj, &mut notes);
+        }
+
+        // 3. Composition : pour chaque pixel, les deux couches du dessus.
+        let backdrop = pal(0);
+        let r = |off: u32| eng.regs[(off / 4) as usize];
+        let (win0h, win1h) = (r(0x40) & 0xFFFF, r(0x40) >> 16);
+        let (win0v, win1v) = (r(0x44) & 0xFFFF, r(0x44) >> 16);
+        let (winin, winout) = (r(0x48) & 0xFFFF, r(0x48) >> 16);
+        let bldcnt = r(0x50) & 0xFFFF;
+        let bldalpha = r(0x50) >> 16;
+        let effect = (bldcnt >> 6) & 3;
+        let (first, second) = (bldcnt & 0x3F, (bldcnt >> 8) & 0x3F);
+        let eva = (bldalpha & 0x1F).min(16) as u16;
+        let evb = ((bldalpha >> 8) & 0x1F).min(16) as u16;
+        let evy = (r(0x54) & 0x1F).min(16) as u16;
+        // Fin exclusive. X1 > X2 (ou Y1 > Y2) : la fenêtre va jusqu'au bord
+        // (GBATEK, page GBA « Window Feature », transposé à 256×192).
+        let inside = |v: u32, reg: u32| {
+            let (lo, hi) = ((reg >> 8) & 0xFF, reg & 0xFF);
+            if lo <= hi { lo <= v && v < hi } else { v >= lo }
+        };
+        let y32 = y as u32;
+        let in_win0 = dispcnt & (1 << 13) != 0 && inside(y32, win0v);
+        let in_win1 = dispcnt & (1 << 14) != 0 && inside(y32, win1v);
+        let windows = dispcnt & 0xE000 != 0;
+
+        for x in 0..WIDTH {
+            let x32 = x as u32;
+            // Couches visibles (bits 0–4) et effets autorisés (bit 5) ici.
+            let mask = if !windows {
+                0x3F
+            } else if in_win0 && inside(x32, win0h) {
+                winin & 0x3F
+            } else if in_win1 && inside(x32, win1h) {
+                (winin >> 8) & 0x3F
+            } else if dispcnt & (1 << 15) != 0 && obj[x].window {
+                (winout >> 8) & 0x3F
+            } else {
+                winout & 0x3F
+            };
+
+            // (clé de tri, bit de la couche, couleur) ; plus petite clé devant.
+            const BACKDROP: (u8, u32, u16) = (u8::MAX, 1 << 5, 0);
+            let mut top = (BACKDROP.0, BACKDROP.1, backdrop);
+            let mut below = top;
+            let mut offer = |key: u8, bit: u32, c: u16| {
+                if key < top.0 {
+                    below = top;
+                    top = (key, bit, c);
+                } else if key < below.0 {
+                    below = (key, bit, c);
+                }
+            };
+            let o = obj[x];
+            if o.prio < 4 && mask & 0x10 != 0 {
+                offer(o.prio * 8, 1 << 4, o.color); // à priorité égale, l'OBJ passe devant
+            }
+            for bg in 0..4 {
+                if bg_on[bg] && mask & (1 << bg) != 0 {
+                    if let Some(c) = bgs[bg][x] {
+                        offer((eng.bgcnt(bg) & 3) as u8 * 8 + 1 + bg as u8, 1 << bg, c);
+                    }
                 }
             }
-            let prio = (self.engines[e].bgcnt(bg) & 3) as u8;
-            for x in 0..WIDTH {
-                if let Some(c) = layer[x] {
-                    // Parcours de l'arrière vers l'avant : le dernier gagne.
-                    line[x] = c;
-                    best_prio[x] = prio;
+
+            let semi_obj = top.1 == 1 << 4 && o.semi;
+            line[x] = if semi_obj && second & below.1 != 0 {
+                blend_alpha(top.2, below.2, eva, evb)
+            } else if mask & 0x20 != 0 && first & top.1 != 0 {
+                match effect {
+                    1 if second & below.1 != 0 => blend_alpha(top.2, below.2, eva, evb),
+                    2 => brightness(top.2, evy, true),
+                    3 => brightness(top.2, evy, false),
+                    _ => top.2,
                 }
-            }
+            } else {
+                top.2
+            };
         }
         for n in notes {
             self.unsupported.insert(n);
@@ -319,6 +384,24 @@ impl Gpu {
     pub fn screen(&self, n: usize) -> &[u32] {
         &self.screens[n]
     }
+}
+
+/// Mélange alpha : (A × EVA + B × EVB) / 16, saturé à 31 par composante.
+fn blend_alpha(a: u16, b: u16, eva: u16, evb: u16) -> u16 {
+    let ch = |s: u32| -> u16 {
+        let (ca, cb) = ((a >> s) & 0x1F, (b >> s) & 0x1F);
+        ((ca * eva + cb * evb) / 16).min(31) << s
+    };
+    ch(0) | ch(5) | ch(10)
+}
+
+/// Éclaircissement (vers le blanc) ou assombrissement (vers le noir).
+fn brightness(c: u16, evy: u16, up: bool) -> u16 {
+    let ch = |s: u32| -> u16 {
+        let v = (c >> s) & 0x1F;
+        (if up { v + (31 - v) * evy / 16 } else { v - v * evy / 16 }) << s
+    };
+    ch(0) | ch(5) | ch(10)
 }
 
 fn master_brightness(c: u16, reg: u32) -> u16 {
@@ -334,7 +417,148 @@ fn master_brightness(c: u16, reg: u32) -> u16 {
     ch(c) | ch(c >> 5) << 5 | ch(c >> 10) << 10
 }
 
+/// Pixel de la couche des sprites.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObjPixel {
+    color: u16,
+    /// 0–3, ou 4 = aucun sprite.
+    prio: u8,
+    /// Sprite semi-transparent (mode 1) : mélangé avec la couche dessous.
+    semi: bool,
+    /// Couvert par un sprite de fenêtre (mode 2).
+    window: bool,
+}
+
+impl ObjPixel {
+    const NONE: ObjPixel = ObjPixel { color: 0, prio: 4, semi: false, window: false };
+}
+
+/// (largeur, hauteur) selon la forme (carré, horizontal, vertical) et la taille.
+const OBJ_SIZES: [[(i32, i32); 4]; 3] = [
+    [(8, 8), (16, 16), (32, 32), (64, 64)],
+    [(16, 8), (32, 8), (32, 16), (64, 32)],
+    [(8, 16), (8, 32), (16, 32), (32, 64)],
+];
+
 impl Engine {
+    /// Dessine les sprites qui coupent la ligne `y`. Ordre OAM : un sprite
+    /// ne remplace un pixel déjà posé que s'il a une priorité plus forte.
+    fn obj_line(&self, y: usize, ctx: &RenderCtx, out: &mut [ObjPixel; WIDTH], notes: &mut Vec<&'static str>) {
+        let oam = if self.is_a { &ctx.oam[..0x400] } else { &ctx.oam[0x400..0x800] };
+        let rd16 = |o: usize| u16::from_le_bytes([oam[o], oam[o + 1]]);
+        let pal_base = if self.is_a { 0x200 } else { 0x600 };
+        let pal = |i: usize| {
+            let o = pal_base + i * 2;
+            u16::from_le_bytes([ctx.palette[o], ctx.palette[o + 1]]) & 0x7FFF
+        };
+        let region = if self.is_a { Region::ObjA } else { Region::ObjB };
+        let dispcnt = self.dispcnt();
+        let one_d = dispcnt & (1 << 4) != 0;
+        let tile_step = 32u32 << ((dispcnt >> 20) & 3);
+        if dispcnt & (1 << 31) != 0 {
+            notes.push("palettes étendues de sprites");
+        }
+
+        for i in 0..128 {
+            let a0 = rd16(i * 8) as u32;
+            let a1 = rd16(i * 8 + 2) as u32;
+            let a2 = rd16(i * 8 + 4) as u32;
+            let affine = a0 & 0x100 != 0;
+            if !affine && a0 & 0x200 != 0 {
+                continue; // sprite masqué
+            }
+            let shape = (a0 >> 14) as usize;
+            if shape == 3 {
+                continue;
+            }
+            let (w, h) = OBJ_SIZES[shape][(a1 >> 14) as usize];
+            let double = affine && a0 & 0x200 != 0;
+            let (bw, bh) = if double { (2 * w, 2 * h) } else { (w, h) };
+            let line = ((y as u32).wrapping_sub(a0 & 0xFF) & 0xFF) as i32;
+            if line >= bh {
+                continue;
+            }
+            let mut sx = (a1 & 0x1FF) as i32;
+            if sx >= 256 {
+                sx -= 512;
+            }
+            let mode = (a0 >> 10) & 3;
+            if a0 & 0x1000 != 0 {
+                notes.push("mosaïque");
+            }
+            let prio = ((a2 >> 10) & 3) as u8;
+            let tile = a2 & 0x3FF;
+            let color256 = a0 & 0x2000 != 0;
+            let (pa, pb, pc, pd) = if affine {
+                let p = ((a1 >> 9) & 0x1F) as usize * 32;
+                let g = |k: usize| rd16(p + 6 + 8 * k) as i16 as i32;
+                (g(0), g(1), g(2), g(3))
+            } else {
+                (0x100, 0, 0, 0x100)
+            };
+            if mode == 3 && a2 >> 12 != 15 {
+                notes.push("alpha des sprites bitmap");
+            }
+
+            for bx in 0..bw {
+                let screen_x = sx + bx;
+                if !(0..WIDTH as i32).contains(&screen_x) {
+                    continue;
+                }
+                let (tx, ty) = if affine {
+                    let (dx, dy) = (bx - bw / 2, line - bh / 2);
+                    let tx = ((pa * dx + pb * dy) >> 8) + w / 2;
+                    let ty = ((pc * dx + pd * dy) >> 8) + h / 2;
+                    if tx < 0 || ty < 0 || tx >= w || ty >= h {
+                        continue;
+                    }
+                    (tx as u32, ty as u32)
+                } else {
+                    let tx = if a1 & 0x1000 != 0 { w - 1 - bx } else { bx };
+                    let ty = if a1 & 0x2000 != 0 { h - 1 - line } else { line };
+                    (tx as u32, ty as u32)
+                };
+                let w = w as u32;
+                let color = if mode == 3 {
+                    // Sprite bitmap : 16 bits par pixel, bit 15 = opaque.
+                    let (base, stride) = if dispcnt & (1 << 6) != 0 {
+                        (tile * (128 << ((dispcnt >> 22) & 1)), w)
+                    } else if dispcnt & (1 << 5) != 0 {
+                        ((tile & 0x1F) * 0x10 + (tile & 0x3E0) * 0x80, 256)
+                    } else {
+                        ((tile & 0x0F) * 0x10 + (tile & 0x3F0) * 0x80, 128)
+                    };
+                    let c = ctx.vram.read16(region, base + (ty * stride + tx) * 2);
+                    (c & 0x8000 != 0).then_some(c & 0x7FFF)
+                } else if color256 {
+                    let off = if one_d {
+                        tile * tile_step + ((ty / 8) * (w / 8) + tx / 8) * 64
+                    } else {
+                        (tile & !1) * 32 + (ty / 8) * 1024 + (tx / 8) * 64
+                    } + (ty % 8) * 8 + tx % 8;
+                    let idx = ctx.vram.read8(region, off) as usize;
+                    (idx != 0).then(|| pal(idx))
+                } else {
+                    let off = if one_d {
+                        tile * tile_step + ((ty / 8) * (w / 8) + tx / 8) * 32
+                    } else {
+                        tile * 32 + (ty / 8) * 1024 + (tx / 8) * 32
+                    } + (ty % 8) * 4 + (tx % 8) / 2;
+                    let b = ctx.vram.read8(region, off);
+                    let idx = ((b >> ((tx & 1) * 4)) & 0xF) as usize;
+                    (idx != 0).then(|| pal((a2 >> 12) as usize * 16 + idx))
+                };
+                let Some(c) = color else { continue };
+                let px = &mut out[screen_x as usize];
+                if mode == 2 {
+                    px.window = true;
+                } else if prio < px.prio {
+                    *px = ObjPixel { color: c, prio, semi: mode == 1, window: px.window };
+                }
+            }
+        }
+    }
+
     fn char_and_screen_base(&self, bg: usize) -> (u32, u32) {
         let cnt = self.bgcnt(bg) as u32;
         let mut cb = ((cnt >> 2) & 0xF) * 0x4000;

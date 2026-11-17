@@ -288,7 +288,7 @@ impl Hardware {
                 self.raise(irqs);
                 let y = self.lcd.vcount as usize;
                 if y < gpu::HEIGHT {
-                    let ctx = gpu::RenderCtx { vram: &self.vram, palette: &self.palette, powcnt1: self.powcnt1 };
+                    let ctx = gpu::RenderCtx { vram: &self.vram, palette: &self.palette, oam: &self.oam, powcnt1: self.powcnt1 };
                     self.gpu.render_line(y, &ctx);
                     self.trigger_dma(0, Trigger::HBlank);
                 }

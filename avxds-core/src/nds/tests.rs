@@ -883,10 +883,11 @@ fn master_brightness_and_forced_blank() {
 #[test]
 fn unsupported_features_are_noted() {
     let mut nds = gpu_nds();
-    nds.bus9().write32(0x0400_0000, 0x0001_1108); // BG0 en 3D + sprites
+    nds.bus9().write32(0x0400_0000, 0x0001_0308); // BG0 en 3D + BG1
+    nds.bus9().write16(0x0400_000A, 0x0040); // BG1 avec mosaïque
     nds.run_frame();
     let notes = &nds.hw.gpu.unsupported;
-    assert!(notes.contains("3D (BG0)") && notes.contains("sprites (OBJ)"), "{notes:?}");
+    assert!(notes.contains("3D (BG0)") && notes.contains("mosaïque"), "{notes:?}");
 }
 
 // ======================================================================
@@ -975,4 +976,238 @@ fn hblank_dma_changes_backdrop_every_line() {
         assert_eq!(pixel(&nds, 1, 0, y), rgb((y - 1) as u16), "ligne {y}");
     }
     assert_ne!(nds.hw.dma[0].ch[0].cnt & DMA_ON, 0, "toujours actif (répétition)");
+}
+
+// ======================================================================
+// GPU : sprites, fenêtres, mélange
+// ======================================================================
+
+/// Moteur A en haut : sprites activés (mapping 1D), banque B en VRAM de
+/// sprites, banque A en VRAM de fonds. Tous les sprites masqués.
+fn obj_nds(dispcnt: u32) -> Nds {
+    let mut nds = gpu_nds();
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0240, 0x81); // A → fonds du moteur A
+        bus.write8(0x0400_0241, 0x82); // B → sprites du moteur A
+        bus.write32(0x0400_0000, 0x0001_0000 | dispcnt);
+        for i in 0..128 {
+            bus.write16(0x0700_0000 + 8 * i, 0x0200); // masqué
+        }
+        bus.write16(0x0500_0000, BLUE); // fond
+        bus.write16(0x0500_0202, RED); // palette des sprites
+        bus.write16(0x0500_0204, GREEN);
+    }
+    nds
+}
+
+fn sprite(nds: &mut Nds, i: u32, a0: u16, a1: u16, a2: u16) {
+    let mut bus = nds.bus9();
+    bus.write16(0x0700_0000 + 8 * i, a0);
+    bus.write16(0x0700_0002 + 8 * i, a1);
+    bus.write16(0x0700_0004 + 8 * i, a2);
+}
+
+/// Tuile 4 bits n° `tile` (mapping 1D, pas de 32) : ligne `row` = 1, 2, 0…
+fn obj_tile_row(nds: &mut Nds, tile: u32, row: u32) {
+    nds.bus9().write16(0x0640_0000 + tile * 32 + row * 4, 0x0021);
+}
+
+/// BG0 du moteur A rempli d'une couleur unie (tuile 1, index 1 partout).
+fn solid_bg0(nds: &mut Nds, color: u16, prio: u16) {
+    let mut bus = nds.bus9();
+    for i in 0..8 {
+        bus.write32(0x0600_0020 + 4 * i, 0x1111_1111);
+    }
+    for i in 0..1024 {
+        bus.write16(0x0600_1000 + 2 * i, 0x0001);
+    }
+    bus.write16(0x0400_0008, (2 << 8) | prio);
+    bus.write16(0x0500_0002, color);
+    let d = bus.read32(0x0400_0000);
+    bus.write32(0x0400_0000, d | 0x100);
+}
+
+#[test]
+fn sprite_4bpp_basic_flip_and_negative_x() {
+    let mut nds = obj_nds(0x1010);
+    obj_tile_row(&mut nds, 0, 0);
+    sprite(&mut nds, 0, 20, 10, 0); // 8×8 en (10, 20)
+    sprite(&mut nds, 1, 20, 40 | 0x1000, 0); // miroir horizontal en (40, 20)
+    sprite(&mut nds, 2, 30, 0x1FF, 0); // X = -1
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED));
+    assert_eq!(pixel(&nds, 0, 11, 20), rgb(GREEN));
+    assert_eq!(pixel(&nds, 0, 12, 20), rgb(BLUE), "index 0 transparent");
+    assert_eq!(pixel(&nds, 0, 10, 19), rgb(BLUE));
+    assert_eq!(pixel(&nds, 0, 47, 20), rgb(RED), "miroir");
+    assert_eq!(pixel(&nds, 0, 46, 20), rgb(GREEN));
+    assert_eq!(pixel(&nds, 0, 0, 30), rgb(GREEN), "X négatif : 1re colonne coupée");
+}
+
+#[test]
+fn sprite_wraps_vertically() {
+    let mut nds = obj_nds(0x1010);
+    obj_tile_row(&mut nds, 0, 7);
+    sprite(&mut nds, 0, 250, 10, 0); // lignes 250–255 puis 0–1
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 1), rgb(RED), "ligne 7 du sprite en Y = 1");
+}
+
+#[test]
+fn sprite_256_colors_2d_mapping() {
+    let mut nds = obj_nds(0x1000); // mapping 2D
+    nds.bus9().write16(0x0640_0000 + 2 * 32 + 64, 0x0005); // tuile 2, 2e tuile en largeur
+    nds.bus9().write16(0x0500_020A, GREEN);
+    sprite(&mut nds, 0, 0x2000 | 0x4000 | 50, 60, 2); // 16×8, 256 couleurs
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 68, 50), rgb(GREEN));
+    assert_eq!(pixel(&nds, 0, 60, 50), rgb(BLUE));
+}
+
+#[test]
+fn sprite_priorities() {
+    let mut nds = obj_nds(0x1010);
+    obj_tile_row(&mut nds, 0, 0);
+    solid_bg0(&mut nds, BLUE | GREEN, 1);
+    sprite(&mut nds, 0, 20, 10, 1 << 10); // priorité 1 = celle du fond
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED), "à priorité égale, le sprite est devant");
+    sprite(&mut nds, 0, 20, 10, 2 << 10);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(BLUE | GREEN), "priorité 2 : derrière le fond");
+
+    // Deux sprites superposés : le plus petit numéro OAM gagne à priorité égale.
+    nds.bus9().write16(0x0640_0020, 0x0012); // tuile 1 : vert puis rouge
+    sprite(&mut nds, 0, 20, 10, 0);
+    sprite(&mut nds, 1, 20, 10, 1);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED));
+    sprite(&mut nds, 0, 20, 10, 1 << 10);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(GREEN), "sauf si l'autre a une priorité plus forte");
+}
+
+#[test]
+fn affine_sprite_double_size_zoom() {
+    let mut nds = obj_nds(0x1010);
+    obj_tile_row(&mut nds, 0, 0);
+    {
+        let mut bus = nds.bus9();
+        // Paramètres affines n° 0 : zoom ×2 (PA = PD = 0,5).
+        bus.write16(0x0700_0006, 0x0080);
+        bus.write16(0x0700_000E, 0);
+        bus.write16(0x0700_0016, 0);
+        bus.write16(0x0700_001E, 0x0080);
+    }
+    sprite(&mut nds, 0, 0x0300 | 40, 100, 0); // affine, double taille : boîte 16×16
+    nds.run_frame();
+    let row: Vec<u32> = (100..106).map(|x| pixel(&nds, 0, x, 40)).collect();
+    assert_eq!(row, [rgb(RED), rgb(RED), rgb(GREEN), rgb(GREEN), rgb(BLUE), rgb(BLUE)]);
+    assert_eq!(pixel(&nds, 0, 100, 41), rgb(RED), "chaque pixel source couvre 2 lignes");
+    assert_eq!(pixel(&nds, 0, 100, 42), rgb(BLUE));
+}
+
+#[test]
+fn bitmap_sprite() {
+    let mut nds = obj_nds(0x1050); // OBJ, mapping bitmap 1D
+    nds.bus9().write16(0x0640_0000, RED | 0x8000);
+    nds.bus9().write16(0x0640_0002, GREEN); // bit 15 à 0 : transparent
+    sprite(&mut nds, 0, 0x0C00 | 70, 80, 0xF000); // mode bitmap, alpha 15
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 80, 70), rgb(RED));
+    assert_eq!(pixel(&nds, 0, 81, 70), rgb(BLUE));
+    assert!(nds.hw.gpu.unsupported.is_empty(), "{:?}", nds.hw.gpu.unsupported);
+}
+
+#[test]
+fn window_0_hides_background_inside() {
+    let mut nds = obj_nds(0x2000); // WIN0, pas de sprites
+    solid_bg0(&mut nds, RED, 0);
+    {
+        let mut bus = nds.bus9();
+        bus.write16(0x0400_0040, (100 << 8) | 150); // X : 100 ≤ x < 150
+        bus.write16(0x0400_0044, (50 << 8) | 60); // Y : 50 ≤ y < 60
+        bus.write16(0x0400_0048, 0x0000); // dedans : rien
+        bus.write16(0x0400_004A, 0x0001); // dehors : BG0
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 120, 55), rgb(BLUE), "dans la fenêtre : couleur de fond");
+    assert_eq!(pixel(&nds, 0, 99, 55), rgb(RED));
+    assert_eq!(pixel(&nds, 0, 150, 55), rgb(RED), "X2 exclu");
+    assert_eq!(pixel(&nds, 0, 120, 60), rgb(RED), "Y2 exclu");
+}
+
+#[test]
+fn object_window() {
+    let mut nds = obj_nds(0x9010); // fenêtre OBJ + sprites (bits 15 et 12)
+    solid_bg0(&mut nds, RED, 0);
+    obj_tile_row(&mut nds, 0, 0);
+    nds.bus9().write16(0x0400_004A, 0x0001); // dehors : BG0 ; fenêtre OBJ : rien
+    sprite(&mut nds, 0, 0x0800 | 20, 10, 0); // mode « fenêtre »
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(BLUE), "sous la fenêtre OBJ : fond masqué");
+    assert_eq!(pixel(&nds, 0, 12, 20), rgb(RED), "pixel transparent du sprite : dehors");
+}
+
+#[test]
+fn alpha_blending_and_brightness() {
+    let mut nds = obj_nds(0x1010);
+    solid_bg0(&mut nds, BLUE, 0);
+    obj_tile_row(&mut nds, 0, 0);
+    // Sprite semi-transparent rouge sur BG0 bleu, EVA = EVB = 8.
+    sprite(&mut nds, 0, 0x0400 | 20, 10, 0);
+    nds.bus9().write16(0x0400_0050, 1 << 8); // 2e cible : BG0
+    nds.bus9().write16(0x0400_0052, (8 << 8) | 8);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(15 | (15 << 10)), "moitié rouge, moitié bleu");
+
+    // Mélange de fonds : BG0 (1re cible) sur la couleur de fond (2e cible).
+    sprite(&mut nds, 0, 0x0200, 0, 0);
+    nds.bus9().write16(0x0500_0000, GREEN);
+    nds.bus9().write16(0x0400_0050, (1 << 6) | 1 | (1 << 13));
+    nds.bus9().write16(0x0400_0052, (16 << 8) | 16);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(BLUE | GREEN), "saturé à 31");
+
+    // Assombrissement de BG0 de moitié…
+    nds.bus9().write16(0x0400_0050, (3 << 6) | 1);
+    nds.bus9().write16(0x0400_0054, 8);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(16 << 10));
+    // … sauf dans une fenêtre qui n'autorise pas les effets.
+    let dispcnt = nds.bus9().read32(0x0400_0000);
+    nds.bus9().write32(0x0400_0000, dispcnt | 0x2000);
+    nds.bus9().write16(0x0400_0040, 0x00FF);
+    nds.bus9().write16(0x0400_0044, 0x00C0);
+    nds.bus9().write16(0x0400_0048, 0x0001); // dedans : BG0 sans effet
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(BLUE));
+}
+
+#[test]
+fn window_with_x1_greater_than_x2_reaches_the_edge() {
+    let mut nds = obj_nds(0x2000);
+    solid_bg0(&mut nds, RED, 0);
+    {
+        let mut bus = nds.bus9();
+        bus.write16(0x0400_0040, (200 << 8) | 10); // X1 = 200 > X2 = 10
+        bus.write16(0x0400_0044, 0x00C0); // toutes les lignes
+        bus.write16(0x0400_004A, 0x0001); // dehors : BG0
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 250, 5), rgb(BLUE), "de X1 jusqu'au bord : dedans");
+    assert_eq!(pixel(&nds, 0, 5, 5), rgb(RED), "pas de retour au début de ligne");
+}
+
+#[test]
+fn semi_transparent_sprite_without_second_target_stays_opaque() {
+    let mut nds = obj_nds(0x1010);
+    solid_bg0(&mut nds, BLUE, 0);
+    obj_tile_row(&mut nds, 0, 0);
+    sprite(&mut nds, 0, 0x0400 | 20, 10, 0); // semi-transparent
+    nds.bus9().write16(0x0400_0050, 1 << 9); // 2e cible : BG1 seulement (absent ici)
+    nds.bus9().write16(0x0400_0052, (8 << 8) | 8);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED), "rien à mélanger : sprite opaque");
 }
