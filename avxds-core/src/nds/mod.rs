@@ -5,7 +5,11 @@
 //! pointeurs partagés, pas de `RefCell`, le borrow checker est satisfait par
 //! des emprunts disjoints.
 
+mod boot;
+mod cart;
 mod cp15;
+mod hle_bios;
+mod hle_swi;
 mod ipc;
 mod irq;
 mod lcd;
@@ -17,7 +21,10 @@ mod vram;
 #[cfg(test)]
 mod tests;
 
+pub use boot::BootError;
+pub use cart::{crc16, CartError, Header};
 pub use cp15::Cp15;
+pub use hle_bios::{BIOS7 as HLE_BIOS7, BIOS9 as HLE_BIOS9};
 pub use irq::{bits as irq_bits, IrqController};
 pub use ipc::IpcFifo;
 pub use lcd::{Lcd, FRAME_CYCLES, LINE_CYCLES};
@@ -90,6 +97,14 @@ pub struct Hardware {
 
     /// Registres I/O accédés mais pas encore émulés (pour le débogage).
     pub unhandled_io: BTreeSet<(CpuId, u32)>,
+
+    /// Appels BIOS émulés en Rust (mini-BIOS chargé). Désactivé, chaque SWI
+    /// passe par le BIOS chargé (par exemple un vrai BIOS ou bios9.bin).
+    pub hle: bool,
+    /// SWI appelés mais pas encore émulés (pour le débogage).
+    pub unhandled_swi: BTreeSet<(CpuId, u8)>,
+    /// ROM de la cartouche insérée (vide si aucune).
+    pub rom: Vec<u8>,
 }
 
 fn zeroed(size: usize) -> Box<[u8]> {
@@ -129,6 +144,9 @@ impl Default for Hardware {
             now: 0,
             arm7_halt_request: false,
             unhandled_io: BTreeSet::new(),
+            hle: false,
+            unhandled_swi: BTreeSet::new(),
+            rom: Vec::new(),
         }
     }
 }
@@ -496,6 +514,38 @@ impl Bus for Arm9Bus<'_> {
     fn cp15_write(&mut self, op: Cp15Op, val: u32) {
         self.hw.cp15.write(op, val);
     }
+    fn hle_swi(&mut self, num: u8, regs: &mut [u32; 4]) -> bool {
+        swi_hook(self, CpuId::Arm9, num, regs)
+    }
+}
+
+/// HLE d'un SWI pour l'une ou l'autre vue du bus.
+fn swi_hook<B: Bus + HasHardware>(bus: &mut B, cpu: CpuId, num: u8, regs: &mut [u32; 4]) -> bool {
+    if !bus.hardware().hle {
+        return false;
+    }
+    match hle_swi::swi(bus, cpu, num, regs) {
+        hle_swi::Swi::Handled => true,
+        hle_swi::Swi::Bios => false,
+        hle_swi::Swi::Unhandled => {
+            bus.hardware().unhandled_swi.insert((cpu, num));
+            true
+        }
+    }
+}
+
+trait HasHardware {
+    fn hardware(&mut self) -> &mut Hardware;
+}
+impl HasHardware for Arm9Bus<'_> {
+    fn hardware(&mut self) -> &mut Hardware {
+        self.hw
+    }
+}
+impl HasHardware for Arm7Bus<'_> {
+    fn hardware(&mut self) -> &mut Hardware {
+        self.hw
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -649,6 +699,9 @@ impl Bus for Arm7Bus<'_> {
             Target::Io => self.io_write(addr, val, u32::MAX),
             _ => {}
         }
+    }
+    fn hle_swi(&mut self, num: u8, regs: &mut [u32; 4]) -> bool {
+        swi_hook(self, CpuId::Arm7, num, regs)
     }
 }
 

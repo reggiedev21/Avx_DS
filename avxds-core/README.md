@@ -50,12 +50,21 @@ src/nds/scheduler.rs  ordonnanceur d'événements (temps en cycles ARM9)
 src/nds/lcd.rs      timing de l'écran : lignes, HBlank, VBlank, DISPSTAT, VCOUNT
 src/nds/timers.rs   4 timers par CPU (prescaler, cascade, IRQ)
 src/nds/ipc.rs      FIFO IPC (16 mots dans chaque sens)
-src/nds/tests.rs    34 tests de la machine
+src/nds/cart.rs     en-tête .nds, CRC16
+src/nds/boot.rs     direct boot (état laissé par le firmware)
+src/nds/hle_bios.rs mini-BIOS d'AvxDS (vecteurs, relais d'IRQ, IntrWait, Halt)
+src/nds/hle_swi.rs  appels BIOS en Rust (Div, CpuSet, LZ77…)
+src/nds/tests.rs    40 tests de la machine
+tests/boot.rs       direct boot d'une vraie ROM compilée pour le projet
+tests/roms/         sources et binaire de cette ROM (C, ARM9 + ARM7)
 tests/programs.rs   tests d'intégration : programmes C réels
 tests/programs/     suite.c + binaires compilés + valeurs attendues
-examples/bench.rs   débit de l'interpréteur
+examples/bench.rs   débit de l'interpréteur et de la machine
+examples/boot_report.rs  démarre une ROM et liste ce qui manque
 tools/asm.py        réassemble les blocs `// asm:` des tests unitaires
 tools/build_programs.sh   recompile les programmes de test
+tools/build_test_roms.sh  recompile les ROMs de test (tests/roms/)
+tools/make_nds.py   assemble une ROM .nds depuis deux binaires
 ```
 
 ## Tests
@@ -83,9 +92,14 @@ Les binaires sont versionnés : `cargo test` n'a besoin d'aucun outil LLVM.
 ```rust
 use avxds_core::Nds;
 let mut nds = Nds::new();
-nds.load_bios9(&bios9);   // facultatif : le BIOS maison ou un stub
-nds.reset();
+let header = nds.direct_boot(std::fs::read("jeu.nds")?)?; // sans BIOS Nintendo
 loop { nds.run_frame(); } // jusqu'au début exact du prochain VBlank
+```
+
+Pour savoir ce qui manque à une ROM :
+
+```
+cargo run --release --example boot_report -- jeu.nds 120
 ```
 
 Déjà émulé :
@@ -99,6 +113,7 @@ Déjà émulé :
 | Écran | 263 lignes × 4260 cycles ARM9, HBlank/VBlank, VCOUNT, DISPSTAT par CPU, IRQ VBlank/HBlank/VCount (LYC sur 9 bits) |
 | Timers | 4 par CPU, F/1 à F/1024, cascade, IRQ, compteur calculé à la lecture |
 | IPC | IPCSYNC, IPCFIFO avec drapeaux, erreurs et IRQ |
+| Boot | Direct boot : binaires, en-tête en 0x027FFE00, CP15, piles ; mini-BIOS maison ; SWI en Rust |
 | Divers | DIVCNT/SQRTCNT, KEYINPUT/EXTKEYIN (touches relâchées), POWCNT, POSTFLG, HALTCNT |
 
 Les registres I/O pas encore émulés sont notés dans `nds.hw.unhandled_io`
@@ -117,7 +132,7 @@ Les registres I/O pas encore émulés sont notés dans `nds.hw.unhandled_io`
 
 ## Prochaines étapes
 
-1. Direct boot d'un `.nds` + HLE des SWI.
-2. Affichage en mode framebuffer VRAM (DISPCNT mode 2) : `test_triangle.nds`,
-   puis `mandel.nds`.
+1. Affichage : mode framebuffer VRAM, puis fond bitmap affine de BG2
+   (`mandel.nds`) ; DMA ; frontend.
+2. Commandes de cartouche (lecture de la ROM par le jeu).
 3. ROMs de test CPU (armwrestler, rockwrestler) en plus de cette suite.

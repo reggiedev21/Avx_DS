@@ -612,3 +612,104 @@ fn arm9_program_polls_three_vblanks() {
     let frame = nds.now() as f64 / FRAME_CYCLES as f64;
     assert!((2.68..2.75).contains(&frame), "≈ 2 images + 192/263 : {frame:.3}");
 }
+
+// ======================================================================
+// En-tête, CRC16, HLE des SWI
+// ======================================================================
+
+#[test]
+fn crc16_matches_reference_values() {
+    assert_eq!(crc16(0xFFFF, *b"123456789"), 0x4B37, "CRC-16/MODBUS");
+    assert_eq!(crc16(0, []), 0);
+}
+
+fn swi(nds: &mut Nds, num: u8, regs: [u32; 4]) -> (hle_swi::Swi, [u32; 4]) {
+    let mut r = regs;
+    let res = hle_swi::swi(&mut nds.bus9(), CpuId::Arm9, num, &mut r);
+    (res, r)
+}
+
+fn put_bytes(nds: &mut Nds, addr: u32, data: &[u8]) {
+    let mut bus = nds.bus9();
+    for (i, b) in data.iter().enumerate() {
+        bus.write8(addr + i as u32, *b);
+    }
+}
+
+fn get_bytes(nds: &mut Nds, addr: u32, len: usize) -> Vec<u8> {
+    let mut bus = nds.bus9();
+    (0..len as u32).map(|i| bus.read8(addr + i)).collect()
+}
+
+#[test]
+fn hle_lz77_and_run_length() {
+    let mut nds = Nds::new();
+    // "ABC" en clair, puis « 6 octets à 3 en arrière », puis "X".
+    put_bytes(&mut nds, 0x0200_0000, &[0x10, 10, 0, 0, 0b0001_0000, b'A', b'B', b'C', 0x30, 0x02, b'X']);
+    let (res, _) = swi(&mut nds, 0x11, [0x0200_0000, 0x0200_1000, 0, 0]);
+    assert_eq!(res, hle_swi::Swi::Handled);
+    assert_eq!(get_bytes(&mut nds, 0x0200_1000, 10), b"ABCABCABCX");
+
+    // RLE : 5 × 'A' (compressé), 'B' (brut), "xyz" (brut).
+    put_bytes(&mut nds, 0x0200_0100, &[0x30, 9, 0, 0, 0x82, b'A', 0x00, b'B', 0x02, b'x', b'y', b'z']);
+    swi(&mut nds, 0x14, [0x0200_0100, 0x0200_2000, 0, 0]);
+    assert_eq!(get_bytes(&mut nds, 0x0200_2000, 9), b"AAAAABxyz");
+}
+
+#[test]
+fn hle_cpu_set_modes() {
+    let mut nds = Nds::new();
+    put_bytes(&mut nds, 0x0200_0000, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    swi(&mut nds, 0x0B, [0x0200_0000, 0x0200_0100, 3, 0]); // 3 demi-mots
+    assert_eq!(get_bytes(&mut nds, 0x0200_0100, 8), [1, 2, 3, 4, 5, 6, 0, 0]);
+    swi(&mut nds, 0x0B, [0x0200_0000, 0x0200_0200, 2 | 1 << 24 | 1 << 26, 0]); // remplissage 32 bits
+    assert_eq!(get_bytes(&mut nds, 0x0200_0200, 8), [1, 2, 3, 4, 1, 2, 3, 4]);
+    swi(&mut nds, 0x0C, [0x0200_0000, 0x0200_0300, 1 | 1 << 24, 0]); // FastSet : arrondi à 8 mots
+    assert_eq!(get_bytes(&mut nds, 0x0200_0300 + 28, 4), [1, 2, 3, 4]);
+    assert_eq!(get_bytes(&mut nds, 0x0200_0300 + 32, 4), [0, 0, 0, 0]);
+}
+
+#[test]
+fn hle_math_crc_and_unhandled() {
+    let mut nds = Nds::new();
+    assert_eq!(swi(&mut nds, 0x0D, [1_000_001, 0, 0, 0]).1[0], 1000, "Sqrt");
+    assert_eq!(swi(&mut nds, 0x0D, [u32::MAX, 0, 0, 0]).1[0], 0xFFFF);
+    let (_, r) = swi(&mut nds, 0x09, [(-7i32) as u32, 2, 0, 0]);
+    assert_eq!((r[0] as i32, r[1] as i32, r[3]), (-3, -1, 3), "Div");
+    assert_eq!(swi(&mut nds, 0x09, [1, 0, 0, 0]).0, hle_swi::Swi::Unhandled, "division par zéro signalée");
+    put_bytes(&mut nds, 0x0200_0000, b"123456789");
+    assert_eq!(swi(&mut nds, 0x0E, [0xFFFF, 0x0200_0000, 9, 0]).1[0], 0x4B37, "GetCRC16");
+    assert_eq!(swi(&mut nds, 0x05, [0; 4]).0, hle_swi::Swi::Bios, "VBlankIntrWait passe par le BIOS");
+    assert_eq!(swi(&mut nds, 0x12, [0; 4]).0, hle_swi::Swi::Unhandled, "LZ77 par callback : à faire");
+}
+
+#[test]
+fn unhandled_swi_is_recorded_and_skipped() {
+    let mut nds = Nds::new();
+    nds.hw.hle = true;
+    load_arm(&mut nds, 0x0200_0000, &[0xEF13_0000, 0xE3A00007]); // swi 0x13 ; mov r0, #7
+    nds.arm9.jump(0x0200_0000, false);
+    nds.step();
+    nds.step();
+    assert_eq!(nds.arm9.reg(0), 7, "le jeu continue");
+    assert!(nds.hw.unhandled_swi.contains(&(CpuId::Arm9, 0x13)));
+}
+
+#[test]
+fn header_fields() {
+    let mut rom = vec![0u8; 0x400];
+    rom[..4].copy_from_slice(b"DEMO");
+    rom[0x0C..0x10].copy_from_slice(b"ABCD");
+    let fields: [(usize, u32); 8] = [
+        (0x20, 0x200), (0x24, 0x0200_0800), (0x28, 0x0200_0000), (0x2C, 0x100),
+        (0x30, 0x300), (0x34, 0x0238_0000), (0x38, 0x0238_0000), (0x3C, 0x100),
+    ];
+    for (o, v) in fields {
+        rom[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let h = Header::parse(&rom).unwrap();
+    assert_eq!((h.title.as_str(), h.game_code_str().as_str()), ("DEMO", "ABCD"));
+    assert_eq!((h.arm9_entry, h.arm7_ram_address), (0x0200_0800, 0x0238_0000));
+    rom[0x38..0x3C].copy_from_slice(&0x0600_0000u32.to_le_bytes());
+    assert!(matches!(Header::parse(&rom), Err(CartError::BadLoadAddress("ARM7", _, _))));
+}
