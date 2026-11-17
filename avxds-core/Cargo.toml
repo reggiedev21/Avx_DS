@@ -8,6 +8,10 @@ authors = ["Yassine Mahroug"]
 
 [dependencies]
 
+# Workspace autonome : le Cargo.toml de emu/ déclare son propre workspace
+# (core, frontend, bios) qui n'inclut pas cette crate.
+[workspace]
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
