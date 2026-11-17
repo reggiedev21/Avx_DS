@@ -1,2 +1,5 @@
 target/
 Cargo.lock
+
+# Journal de développement personnel
+JOURNAL_DEV.md
