@@ -364,8 +364,251 @@ fn hardware_square_root() {
 #[test]
 fn unhandled_io_is_recorded() {
     let mut nds = Nds::new();
-    nds.bus9().read32(0x0400_0004);
+    nds.bus9().read32(0x0400_00B0); // DMA0SAD : pas encore émulé
     nds.bus7().write16(0x0400_0504, 0x200);
     let seen: Vec<_> = nds.hw.unhandled_io.iter().copied().collect();
-    assert_eq!(seen, [(CpuId::Arm9, 0x0400_0004), (CpuId::Arm7, 0x0400_0504)]);
+    assert_eq!(seen, [(CpuId::Arm9, 0x0400_00B0), (CpuId::Arm7, 0x0400_0504)]);
+}
+
+// ======================================================================
+// Scheduler
+// ======================================================================
+
+#[test]
+fn scheduler_order_and_cancel() {
+    let mut s = Scheduler::default();
+    assert_eq!(s.next_time(), u64::MAX);
+    s.schedule(Event::LineEnd, 100);
+    s.schedule(Event::Timer(CpuId::Arm7, 2), 50);
+    s.schedule(Event::HBlank, 75);
+    assert_eq!(s.next_time(), 50);
+    assert_eq!(s.pop_due(49), None);
+    assert_eq!(s.pop_due(80), Some((Event::Timer(CpuId::Arm7, 2), 50)));
+    assert_eq!(s.pop_due(80), Some((Event::HBlank, 75)));
+    assert_eq!(s.pop_due(80), None);
+    s.cancel(Event::LineEnd);
+    assert_eq!(s.next_time(), u64::MAX);
+}
+
+/// Machine dont les deux CPU dorment : le temps avance par sauts.
+fn idle_nds() -> Nds {
+    let mut nds = Nds::new();
+    nds.arm9.halted = true;
+    nds.arm7.halted = true;
+    nds
+}
+
+#[test]
+fn frame_cadence() {
+    let mut nds = idle_nds();
+    nds.run_frame();
+    assert_eq!((nds.hw.lcd.vcount, nds.hw.lcd.frames), (192, 1));
+    assert_eq!(nds.hw.lcd.line_start, 192 * LINE_CYCLES);
+    for _ in 0..59 {
+        nds.run_frame();
+    }
+    assert_eq!(nds.hw.lcd.frames, 60);
+    assert_eq!(nds.hw.lcd.line_start, 192 * LINE_CYCLES + 59 * FRAME_CYCLES);
+    assert_eq!(FRAME_CYCLES, 560_190 * 2, "1 120 380 cycles ARM9 par image");
+    assert!(nds.arm9.instructions == 0 && nds.arm7.instructions == 0, "aucune instruction exécutée");
+}
+
+fn dispstat9(nds: &mut Nds) -> u16 {
+    nds.bus9().read16(0x0400_0004)
+}
+
+#[test]
+fn dispstat_flags_and_vcount() {
+    let mut nds = idle_nds();
+    nds.run_until(100);
+    assert_eq!(dispstat9(&mut nds) & 7, 0);
+    nds.run_until(lcd::HBLANK_START);
+    assert_eq!(dispstat9(&mut nds) & 7, 0b010, "HBlank");
+    nds.run_until(LINE_CYCLES);
+    assert_eq!(nds.bus9().read16(0x0400_0006), 1, "VCOUNT");
+    assert_eq!(dispstat9(&mut nds) & 2, 0, "HBlank effacé en début de ligne");
+    nds.run_until(192 * LINE_CYCLES);
+    assert_eq!(dispstat9(&mut nds) & 1, 1, "VBlank à la ligne 192");
+    nds.run_until(261 * LINE_CYCLES);
+    assert_eq!(dispstat9(&mut nds) & 1, 1, "encore VBlank en 261");
+    nds.run_until(262 * LINE_CYCLES);
+    assert_eq!(dispstat9(&mut nds) & 1, 0, "plus de VBlank en 262");
+    nds.run_until(FRAME_CYCLES);
+    assert_eq!(nds.bus7().read16(0x0400_0006), 0, "retour à la ligne 0");
+}
+
+#[test]
+fn vblank_irq_per_cpu() {
+    let mut nds = idle_nds();
+    nds.bus9().write16(0x0400_0004, 1 << 3); // ARM9 : IRQ VBlank
+    nds.run_frame();
+    assert_eq!(nds.hw.irq9.if_ & irq_bits::VBLANK, irq_bits::VBLANK);
+    assert_eq!(nds.hw.irq7.if_, 0, "l'ARM7 n'a rien autorisé");
+    assert_eq!(dispstat9(&mut nds) & 0xFFF8, 1 << 3, "drapeaux en lecture seule");
+}
+
+#[test]
+fn vcount_match_with_9_bit_lyc() {
+    let mut nds = idle_nds();
+    nds.bus7().write16(0x0400_0004, (100 << 8) | (1 << 5)); // ARM7 : ligne 100
+    nds.bus9().write16(0x0400_0004, (4 << 8) | 0x80 | (1 << 5)); // ARM9 : ligne 260
+    nds.run_until(100 * LINE_CYCLES);
+    assert_eq!(nds.hw.irq7.if_, irq_bits::VCOUNT);
+    assert_eq!(nds.bus7().read16(0x0400_0004) & 4, 4);
+    assert_eq!(nds.hw.irq9.if_, 0);
+    nds.run_until(101 * LINE_CYCLES);
+    assert_eq!(nds.bus7().read16(0x0400_0004) & 4, 0, "drapeau effacé à la ligne suivante");
+    nds.run_until(260 * LINE_CYCLES);
+    assert_eq!(nds.hw.irq9.if_, irq_bits::VCOUNT, "LYC sur 9 bits");
+}
+
+#[test]
+fn halted_cpu_wakes_on_vblank_without_busy_loop() {
+    let mut nds = Nds::new();
+    nds.hw.irq9.ie = irq_bits::VBLANK;
+    nds.bus9().write16(0x0400_0004, 1 << 3);
+    nds.arm9.halted = true;
+    nds.arm7.halted = true;
+    nds.run_until(192 * LINE_CYCLES + 10);
+    assert!(!nds.arm9.halted, "réveillé par IE & IF");
+    assert!(nds.arm9.instructions < 20, "pas d'attente active : {}", nds.arm9.instructions);
+}
+
+// ======================================================================
+// Timers
+// ======================================================================
+
+fn timer_write(nds: &mut Nds, cpu: CpuId, n: u32, reload: u16, control: u16) {
+    let addr = 0x0400_0100 + 4 * n;
+    let v = reload as u32 | (control as u32) << 16;
+    match cpu {
+        CpuId::Arm9 => nds.bus9().write32(addr, v),
+        CpuId::Arm7 => nds.bus7().write32(addr, v),
+    }
+}
+
+#[test]
+fn timer_counts_overflows_and_raises_irq() {
+    let mut nds = idle_nds();
+    nds.run_until(1000);
+    timer_write(&mut nds, CpuId::Arm9, 0, 0xFFF0, 0xC0); // F/1, IRQ, activé
+    let start = nds.now();
+    nds.run_until(start + 10 * BUS_CYCLE);
+    assert_eq!(nds.bus9().read16(0x0400_0100), 0xFFFA, "compteur paresseux");
+    assert_eq!(nds.hw.irq9.if_, 0);
+    nds.run_until(start + 16 * BUS_CYCLE);
+    assert_eq!(nds.hw.irq9.if_, irq_bits::TIMER0);
+    assert_eq!(nds.bus9().read16(0x0400_0100), 0xFFF0, "rechargé");
+    nds.run_until(start + 32 * BUS_CYCLE);
+    assert_eq!(nds.hw.timers[0].t[0].start, start + 32 * BUS_CYCLE, "2e débordement à l'heure");
+    assert_eq!(nds.hw.irq7.if_, 0, "timers séparés");
+}
+
+#[test]
+fn timer_prescaler_schedules_far_overflow() {
+    let mut nds = idle_nds();
+    timer_write(&mut nds, CpuId::Arm7, 3, 0, 0x83); // F/1024, sans IRQ
+    let expected = 0x1_0000 * 1024 * BUS_CYCLE;
+    assert_eq!(nds.hw.sched.time_of(Event::Timer(CpuId::Arm7, 3)), Some(expected));
+    nds.run_until(1024 * BUS_CYCLE * 5);
+    assert_eq!(nds.bus7().read16(0x0400_010C), 5);
+}
+
+#[test]
+fn timer_cascade() {
+    let mut nds = idle_nds();
+    timer_write(&mut nds, CpuId::Arm9, 1, 0xFFFE, 0xC4); // cascade, IRQ
+    timer_write(&mut nds, CpuId::Arm9, 0, 0xFFFF, 0x80); // déborde à chaque tic
+    let start = nds.now();
+    assert_eq!(nds.hw.sched.time_of(Event::Timer(CpuId::Arm9, 1)), None, "pas d'événement en cascade");
+    nds.run_until(start + BUS_CYCLE);
+    assert_eq!(nds.bus9().read16(0x0400_0104), 0xFFFF);
+    assert_eq!(nds.hw.irq9.if_, 0);
+    nds.run_until(start + 2 * BUS_CYCLE);
+    assert_eq!(nds.hw.irq9.if_, irq_bits::TIMER1);
+    assert_eq!(nds.bus9().read16(0x0400_0104), 0xFFFE);
+}
+
+#[test]
+fn timer_disable_freezes_and_reenable_reloads() {
+    let mut nds = idle_nds();
+    timer_write(&mut nds, CpuId::Arm9, 2, 100, 0x80);
+    nds.run_until(nds.now() + 7 * BUS_CYCLE);
+    nds.bus9().write16(0x0400_010A, 0x00); // arrêt
+    nds.run_until(nds.now() + 50 * BUS_CYCLE);
+    assert_eq!(nds.bus9().read16(0x0400_0108), 107, "valeur figée");
+    assert_eq!(nds.hw.sched.time_of(Event::Timer(CpuId::Arm9, 2)), None);
+    nds.bus9().write16(0x0400_010A, 0x80); // relance : repart du rechargement
+    assert_eq!(nds.bus9().read16(0x0400_0108), 100);
+}
+
+// ======================================================================
+// FIFO IPC
+// ======================================================================
+
+#[test]
+fn ipc_fifo_transfer_irqs_and_errors() {
+    let mut nds = Nds::new();
+    nds.bus9().write16(0x0400_0184, 0x8000 | 0x4); // ARM9 : FIFO + IRQ « envoi vide »
+    assert_eq!(nds.hw.irq9.if_, irq_bits::IPC_SEND_EMPTY, "autoriser l'IRQ quand c'est déjà vide");
+    nds.hw.irq9.if_ = 0;
+    nds.bus7().write16(0x0400_0184, 0x8000 | 0x400); // ARM7 : FIFO + IRQ « réception »
+    for v in [10, 20, 30] {
+        nds.bus9().write32(0x0400_0188, v);
+    }
+    assert_eq!(nds.hw.irq7.if_, irq_bits::IPC_RECV_NOT_EMPTY);
+    assert_eq!(nds.bus7().read16(0x0400_0184) & 0x0300, 0, "ni vide ni pleine");
+    assert_eq!(nds.bus9().read16(0x0400_0184) & 0x0003, 0);
+    let got: Vec<u32> = (0..3).map(|_| nds.bus7().read32(0x0410_0000)).collect();
+    assert_eq!(got, [10, 20, 30]);
+    assert_eq!(nds.hw.irq9.if_, irq_bits::IPC_SEND_EMPTY, "l'émetteur est prévenu");
+    assert_eq!(nds.bus7().read32(0x0410_0000), 30, "vide : relit le dernier mot");
+    assert_ne!(nds.bus7().read16(0x0400_0184) & 0x4000, 0, "et lève l'erreur");
+    nds.bus7().write16(0x0400_0184, 0xC400);
+    assert_eq!(nds.bus7().read16(0x0400_0184) & 0x4000, 0, "erreur acquittée");
+    for v in 0..17 {
+        nds.bus9().write32(0x0400_0188, v);
+    }
+    let cnt = nds.bus9().read16(0x0400_0184);
+    assert_eq!(cnt & 0x4002, 0x4002, "pleine, et erreur au 17e mot");
+    nds.bus9().write16(0x0400_0184, 0x8008 | 0x4); // vider la file d'envoi
+    assert_eq!(nds.bus7().read16(0x0400_0184) & 0x100, 0x100, "l'ARM7 voit une file vide");
+}
+
+#[test]
+fn ipc_fifo_disabled_ignores_writes() {
+    let mut nds = Nds::new();
+    nds.bus9().write32(0x0400_0188, 1);
+    assert!(nds.hw.fifo.queue[0].is_empty());
+}
+
+#[test]
+fn arm9_program_polls_three_vblanks() {
+    let mut nds = Nds::new();
+    load_arm(&mut nds, 0x0200_0000, // asm: arm
+    &[
+        0xE3A04301, // mov r4, #0x04000000
+        0xE3A05000, // mov r5, #0
+        0xE1D400B4, // wait_end: ldrh r0, [r4, #4]
+        0xE3100001, // tst r0, #1
+        0x1AFFFFFC, // bne wait_end
+        0xE1D400B4, // wait_start: ldrh r0, [r4, #4]
+        0xE3100001, // tst r0, #1
+        0x0AFFFFFC, // beq wait_start
+        0xE2855001, // add r5, r5, #1
+        0xE3550003, // cmp r5, #3
+        0x1AFFFFF6, // bne wait_end
+        0xEAFFFFFE, // done: b done
+    ]);
+    nds.arm9.jump(0x0200_0000, false);
+    nds.arm7.halted = true;
+    for _ in 0..3 {
+        nds.run_frame();
+    }
+    assert_eq!(nds.arm9.reg(5), 2, "le 3e VBlank vient juste de commencer");
+    nds.run_until(nds.now() + 200);
+    assert_eq!(nds.arm9.reg(5), 3);
+    assert_eq!(nds.arm9.pc(), 0x0200_002C);
+    let frame = nds.now() as f64 / FRAME_CYCLES as f64;
+    assert!((2.68..2.75).contains(&frame), "≈ 2 images + 192/263 : {frame:.3}");
 }

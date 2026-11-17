@@ -1,7 +1,7 @@
 //! Mesure grossière du débit de l'interpréteur : exécute en boucle un
 //! programme de test et affiche des millions d'instructions par seconde.
 //! `cargo run --release --example bench`
-use avxds_core::{Arch, Armv4t, Armv5te, Bus, Cpu};
+use avxds_core::{Arch, Armv4t, Armv5te, Bus, Cpu, Nds};
 use std::time::Instant;
 
 struct Flat(Vec<u8>, bool);
@@ -31,7 +31,34 @@ fn bench<A: Arch>(name: &str, prog: &[u8]) {
     println!("{name:<18} {:>7.1} M instructions/s", total as f64 / secs / 1e6);
 }
 
+/// Machine complète : l'ARM9 scrute DISPSTAT en boucle (comme un jeu qui
+/// attend le VBlank), l'ARM7 tourne dans une boucle de calcul.
+fn bench_machine() {
+    let mut nds = Nds::new();
+    let arm9: [u32; 4] = [0xE3A04301, 0xE1D400B4, 0xE3100001, 0xEAFFFFFC]; // mov r4,#0x4000000 ; ldrh ; tst ; b
+    let arm7: [u32; 3] = [0xE2800001, 0xE0811000, 0xEAFFFFFC]; // add ; add ; b
+    {
+        let mut bus = nds.bus9();
+        for (i, w) in arm9.iter().enumerate() { bus.write32(0x0200_0000 + 4 * i as u32, *w); }
+    }
+    {
+        let mut bus = nds.bus7();
+        for (i, w) in arm7.iter().enumerate() { bus.write32(0x0380_0000 + 4 * i as u32, *w); }
+    }
+    nds.arm9.jump(0x0200_0000, false);
+    nds.arm7.jump(0x0380_0000, false);
+    let start = Instant::now();
+    let mut frames = 0;
+    while start.elapsed().as_secs_f64() < 1.0 {
+        nds.run_frame();
+        frames += 1;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    println!("Machine complète  {:>7.1} images/s (une DS : 59,8)", frames as f64 / secs);
+}
+
 fn main() {
+    bench_machine();
     bench::<Armv5te>("ARMv5TE ARM -O2", include_bytes!("../tests/programs/armv5te_arm_O2.bin"));
     bench::<Armv5te>("ARMv5TE Thumb -O2", include_bytes!("../tests/programs/armv5te_thumb_O2.bin"));
     bench::<Armv4t>("ARMv4T ARM -O0", include_bytes!("../tests/programs/armv4t_arm_O0.bin"));

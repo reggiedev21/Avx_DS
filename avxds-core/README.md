@@ -46,7 +46,11 @@ src/nds/cp15.rs     CP15 : contrôle, ITCM/DTCM, registres d'identification
 src/nds/vram.rs     banques A–I, VRAMCNT, zones BG/OBJ/LCDC/ARM7
 src/nds/irq.rs      contrôleur IME/IE/IF (un par CPU)
 src/nds/math.rs     division et racine carrée matérielles
-src/nds/tests.rs    21 tests de la machine
+src/nds/scheduler.rs  ordonnanceur d'événements (temps en cycles ARM9)
+src/nds/lcd.rs      timing de l'écran : lignes, HBlank, VBlank, DISPSTAT, VCOUNT
+src/nds/timers.rs   4 timers par CPU (prescaler, cascade, IRQ)
+src/nds/ipc.rs      FIFO IPC (16 mots dans chaque sens)
+src/nds/tests.rs    34 tests de la machine
 tests/programs.rs   tests d'intégration : programmes C réels
 tests/programs/     suite.c + binaires compilés + valeurs attendues
 examples/bench.rs   débit de l'interpréteur
@@ -81,7 +85,7 @@ use avxds_core::Nds;
 let mut nds = Nds::new();
 nds.load_bios9(&bios9);   // facultatif : le BIOS maison ou un stub
 nds.reset();
-loop { nds.step(); }      // une instruction ARM9 + la part de l'ARM7
+loop { nds.run_frame(); } // jusqu'au début exact du prochain VBlank
 ```
 
 Déjà émulé :
@@ -92,7 +96,9 @@ Déjà émulé :
 | CP15 | Registre de contrôle (vecteurs hauts), ITCM/DTCM avec taille virtuelle, base et mode « load », ID |
 | VRAM | 9 banques, tous les modes MST/OFS, chevauchements (OU en lecture), C/D pour l'ARM7, VRAMSTAT |
 | IRQ | IME/IE/IF séparés pour chaque CPU, réveil du Halt même avec IME = 0 |
-| IPC | IPCSYNC dans les deux sens, IRQ de synchronisation |
+| Écran | 263 lignes × 4260 cycles ARM9, HBlank/VBlank, VCOUNT, DISPSTAT par CPU, IRQ VBlank/HBlank/VCount (LYC sur 9 bits) |
+| Timers | 4 par CPU, F/1 à F/1024, cascade, IRQ, compteur calculé à la lecture |
+| IPC | IPCSYNC, IPCFIFO avec drapeaux, erreurs et IRQ |
 | Divers | DIVCNT/SQRTCNT, KEYINPUT/EXTKEYIN (touches relâchées), POWCNT, POSTFLG, HALTCNT |
 
 Les registres I/O pas encore émulés sont notés dans `nds.hw.unhandled_io`
@@ -102,18 +108,16 @@ Les registres I/O pas encore émulés sont notés dans `nds.hw.unhandled_io`
 
 * Timing : `step()` renvoie un nombre de cycles **approximatif**. Les vrais
   timings (attente mémoire, cache de l'ARM9) viendront avec le scheduler.
-* Ordonnancement provisoire : `Nds::step()` fait avancer l'ARM7 à mi-vitesse
-  par dette de cycles. Le scheduler par événements le remplacera.
-* Pas encore : affichage, timers, DMA, IPCFIFO, cartouche, SPI, son, RTC.
+* Ordonnancement : les CPU avancent par tranches de 64 cycles ARM9 au plus
+  (`MAX_SLICE`), donc jusqu'à 64 cycles de décalage entre eux.
+* Pas encore : affichage, DMA, cartouche, SPI, son, RTC.
 * Simplifications : division instantanée (pas de drapeau « occupé »), MPU et
   caches mémorisés sans effet, protection en lecture du BIOS ARM7 absente,
   slot GBA vide lu à 0, HALTCNT ne gère que le mode Halt.
 
 ## Prochaines étapes
 
-1. Scheduler par événements, timing de l'écran (DISPSTAT, VCOUNT, IRQ
-   VBlank/HBlank), timers, IPCFIFO.
-2. Direct boot d'un `.nds` + HLE des SWI.
-3. Affichage en mode framebuffer VRAM (DISPCNT mode 2) : `test_triangle.nds`,
+1. Direct boot d'un `.nds` + HLE des SWI.
+2. Affichage en mode framebuffer VRAM (DISPCNT mode 2) : `test_triangle.nds`,
    puis `mandel.nds`.
-4. ROMs de test CPU (armwrestler, rockwrestler) en plus de cette suite.
+3. ROMs de test CPU (armwrestler, rockwrestler) en plus de cette suite.
