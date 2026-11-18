@@ -1,0 +1,27 @@
+[package]
+name = "avxds-frontend"
+version = "0.1.0"
+edition = "2021"
+description = "Fenêtre de l'émulateur Nintendo DS AvxDS"
+license = "GPL-2.0-or-later"
+authors = ["Yassine Mahroug"]
+
+[[bin]]
+name = "avxds"
+path = "src/main.rs"
+
+[dependencies]
+avxds-core = { path = "../avxds-core" }
+# Mêmes versions que l'ancien frontend (déjà dans le cache Cargo).
+winit = "0.28"
+pixels = "0.13"
+winit_input_helper = "0.14"
+# Sortie audio (WASAPI sous Windows).
+cpal = "0.18"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
+# Workspace autonome (le Cargo.toml de emu/ en déclare un autre).
+[workspace]
