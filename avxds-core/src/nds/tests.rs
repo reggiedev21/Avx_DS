@@ -887,7 +887,8 @@ fn unsupported_features_are_noted() {
     nds.bus9().write16(0x0400_000A, 0x0040); // BG1 avec mosaïque
     nds.run_frame();
     let notes = &nds.hw.gpu.unsupported;
-    assert!(notes.contains("3D (BG0)") && notes.contains("mosaïque"), "{notes:?}");
+    assert!(notes.contains("mosaïque"), "{notes:?}");
+    assert!(!notes.contains("3D (BG0)"), "le calque 3D est rendu depuis 3D-3 : {notes:?}");
 }
 
 // ======================================================================
@@ -1210,4 +1211,1474 @@ fn semi_transparent_sprite_without_second_target_stays_opaque() {
     nds.bus9().write16(0x0400_0052, (8 << 8) | 8);
     nds.run_frame();
     assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED), "rien à mélanger : sprite opaque");
+}
+
+// ======================================================================
+// Cartouche (slot 1)
+// ======================================================================
+
+fn cart_nds() -> Nds {
+    let mut nds = Nds::new();
+    nds.hw.rom = (0..0x1_0000u32).map(|i| (i * 7 + (i >> 8)) as u8).collect();
+    nds.hw.slot1.chip_id = 0x0000_00C2;
+    nds
+}
+
+/// Envoie une commande de cartouche et lit les données en scrutant ROMCTRL.
+fn cart_read(nds: &mut Nds, cmd: [u8; 8], block: u32) -> Vec<u8> {
+    let mut bus = nds.bus9();
+    bus.write32(0x0400_01A8, u32::from_le_bytes(cmd[..4].try_into().unwrap()));
+    bus.write32(0x0400_01AC, u32::from_le_bytes(cmd[4..].try_into().unwrap()));
+    bus.write32(0x0400_01A4, 0x8000_0000 | (1 << 29) | (block << 24));
+    let mut out = Vec::new();
+    while bus.read32(0x0400_01A4) & (1 << 23) != 0 {
+        out.extend_from_slice(&bus.read32(0x0410_0010).to_le_bytes());
+    }
+    assert_eq!(bus.read32(0x0400_01A4) & (1 << 31), 0, "transfert terminé");
+    out
+}
+
+fn b7(addr: u32) -> [u8; 8] {
+    let a = addr.to_be_bytes();
+    [0xB7, a[0], a[1], a[2], a[3], 0, 0, 0]
+}
+
+#[test]
+fn cartridge_b7_read() {
+    let mut nds = cart_nds();
+    let data = cart_read(&mut nds, b7(0x9000), 1);
+    assert_eq!(data.len(), 0x200);
+    assert_eq!(&data[..], &nds.hw.rom[0x9000..0x9200]);
+}
+
+#[test]
+fn cartridge_b7_redirect_wrap_and_mirror() {
+    let mut nds = cart_nds();
+    let data = cart_read(&mut nds, b7(0x0123), 1);
+    assert_eq!(data[0], nds.hw.rom[0x8123], "adresses < 0x8000 → 0x8000 + (addr & 0x1FF)");
+    let data = cart_read(&mut nds, b7(0x8F80), 1);
+    assert_eq!(data[0x7F], nds.hw.rom[0x8FFF]);
+    assert_eq!(data[0x80], nds.hw.rom[0x8000], "retour au début du bloc de 4 Ko");
+    let data = cart_read(&mut nds, b7(0x1_9000), 7);
+    assert_eq!(&data[..], &nds.hw.rom[0x9000..0x9004], "miroir au-delà de la taille de la puce");
+}
+
+#[test]
+fn cartridge_chip_id_and_header() {
+    let mut nds = cart_nds();
+    let id = cart_read(&mut nds, [0xB8, 0, 0, 0, 0, 0, 0, 0], 7);
+    assert_eq!(id, [0xC2, 0, 0, 0]);
+    let hdr = cart_read(&mut nds, [0; 8], 1);
+    assert_eq!(&hdr[..16], &nds.hw.rom[..16]);
+    let dummy = cart_read(&mut nds, [0x9F, 0, 0, 0, 0, 0, 0, 0], 7);
+    assert_eq!(dummy, [0xFF; 4]);
+}
+
+#[test]
+fn cartridge_irq_goes_to_slot_owner() {
+    let mut nds = cart_nds();
+    nds.bus9().write16(0x0400_01A0, 0xC000); // slot activé + IRQ de fin
+    cart_read(&mut nds, b7(0x8000), 7);
+    assert_eq!(nds.hw.irq9.if_, irq_bits::CARD_TRANSFER);
+    nds.hw.irq9.if_ = 0;
+    nds.bus9().write16(0x0400_0204, 1 << 11); // slot 1 à l'ARM7
+    cart_read(&mut nds, b7(0x8000), 7);
+    assert_eq!((nds.hw.irq9.if_, nds.hw.irq7.if_), (0, irq_bits::CARD_TRANSFER));
+    assert_eq!(nds.bus7().read16(0x0400_0204) & (1 << 11), 1 << 11, "l'ARM7 relit EXMEMCNT");
+}
+
+#[test]
+fn cartridge_dma_before_and_after_start() {
+    for dma_first in [true, false] {
+        let mut nds = cart_nds();
+        let start = |nds: &mut Nds| {
+            let mut bus = nds.bus9();
+            bus.write32(0x0400_01A8, u32::from_le_bytes([0xB7, 0, 0, 0xA0]));
+            bus.write32(0x0400_01AC, 0);
+            bus.write32(0x0400_01A4, 0x8000_0000 | (1 << 29) | (1 << 24));
+        };
+        let dma = |nds: &mut Nds| {
+            // DMA3 : source fixe 0x04100010, 1 mot, répétition, déclencheur 5.
+            dma(nds, CpuId::Arm9, 3, 0x0410_0010, 0x0200_0000,
+                DMA_ON | DMA_32 | (1 << 25) | (5 << 27) | (2 << 23) | 1);
+        };
+        if dma_first {
+            dma(&mut nds);
+            start(&mut nds);
+        } else {
+            start(&mut nds);
+            dma(&mut nds);
+        }
+        let got: Vec<u8> = (0..0x200u32).map(|i| nds.bus9().read8(0x0200_0000 + i)).collect();
+        assert_eq!(&got[..], &nds.hw.rom[0xA000..0xA200], "DMA activée {}", if dma_first { "avant" } else { "après" });
+        assert_eq!(nds.bus9().read32(0x0400_01A4) & (1 << 31), 0);
+    }
+}
+
+#[test]
+fn save_command_byte_answers_ff() {
+    let mut nds = cart_nds();
+    nds.bus9().write16(0x0400_01A0, 0xA040);
+    nds.bus9().write8(0x0400_01A2, 0x05); // RDSR d'une EEPROM
+    assert_eq!(nds.bus9().read8(0x0400_01A2), 0xFF);
+}
+
+// ======================================================================
+// SPI : firmware, alimentation, écran tactile
+// ======================================================================
+
+/// Un octet sur le SPI. `last` = dernier octet de la commande.
+fn spi(nds: &mut Nds, device: u16, byte: u8, last: bool) -> u8 {
+    let mut bus = nds.bus7();
+    let hold = if last { 0 } else { 1 << 11 };
+    bus.write16(0x0400_01C0, 0x8000 | (device << 8) | hold);
+    bus.write16(0x0400_01C2, byte as u16);
+    assert_eq!(bus.read16(0x0400_01C0) & 0x80, 0, "jamais occupé");
+    bus.read16(0x0400_01C2) as u8
+}
+
+fn spi_cmd(nds: &mut Nds, device: u16, send: &[u8], receive: usize) -> Vec<u8> {
+    let total = send.len() + receive;
+    let mut out = Vec::new();
+    for i in 0..total {
+        let b = send.get(i).copied().unwrap_or(0);
+        let r = spi(nds, device, b, i == total - 1);
+        if i >= send.len() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+#[test]
+fn firmware_id_header_and_user_settings() {
+    let mut nds = Nds::new();
+    assert_eq!(spi_cmd(&mut nds, 1, &[0x9F], 3), [0x20, 0x40, 0x12]);
+    let ptr = spi_cmd(&mut nds, 1, &[0x03, 0x00, 0x00, 0x20], 2);
+    assert_eq!(u16::from_le_bytes([ptr[0], ptr[1]]) as u32 * 8, 0x3FE00);
+    let us = spi_cmd(&mut nds, 1, &[0x03, 0x03, 0xFE, 0x00], 0x74);
+    assert_eq!(us[0], 5, "version");
+    let nick: Vec<u16> = (0..5).map(|i| u16::from_le_bytes([us[6 + 2 * i], us[7 + 2 * i]])).collect();
+    assert_eq!(String::from_utf16(&nick).unwrap(), "AvxDS");
+    assert_eq!(u16::from_le_bytes([us[0x72], us[0x73]]), crc16(0xFFFF, us[..0x70].iter().copied()), "CRC valide");
+}
+
+#[test]
+fn firmware_write_needs_write_enable() {
+    let mut nds = Nds::new();
+    spi_cmd(&mut nds, 1, &[0x0A, 0x00, 0x10, 0x00, 1, 2, 3], 0); // sans WREN
+    assert_eq!(spi_cmd(&mut nds, 1, &[0x03, 0x00, 0x10, 0x00], 3), [0xFF; 3]);
+    spi_cmd(&mut nds, 1, &[0x06], 0);
+    assert_eq!(spi_cmd(&mut nds, 1, &[0x05], 1), [0x02], "WEL");
+    spi_cmd(&mut nds, 1, &[0x0A, 0x00, 0x10, 0x00, 1, 2, 3], 0);
+    assert_eq!(spi_cmd(&mut nds, 1, &[0x03, 0x00, 0x10, 0x00], 3), [1, 2, 3]);
+    assert_eq!(spi_cmd(&mut nds, 1, &[0x05], 1), [0x00], "WEL retombe après l'écriture");
+}
+
+#[test]
+fn power_manager_registers() {
+    let mut nds = Nds::new();
+    assert_eq!(spi_cmd(&mut nds, 0, &[0x80], 1), [0x0F]);
+    spi_cmd(&mut nds, 0, &[0x00, 0x0C], 0);
+    assert_eq!(spi_cmd(&mut nds, 0, &[0x80], 1), [0x0C]);
+    assert!(!nds.hw.spi.power.shutdown_requested);
+    spi_cmd(&mut nds, 0, &[0x00, 0x40], 0);
+    assert!(nds.hw.spi.power.shutdown_requested, "extinction demandée");
+}
+
+/// Lit un canal du TSC en 12 bits, comme libnds : commande, puis 2 octets.
+fn tsc(nds: &mut Nds, channel: u8) -> u16 {
+    let r = spi_cmd(nds, 2, &[0x80 | (channel << 4)], 2);
+    ((r[0] as u16) << 5) | (r[1] as u16 >> 3)
+}
+
+/// Formule de GBATEK pour revenir aux pixels.
+fn adc_to_pixel(adc: u16, adc1: i32, scr1: i32, adc2: i32, scr2: i32) -> i32 {
+    (adc as i32 - adc1) * (scr2 - scr1) / (adc2 - adc1) + (scr1 - 1)
+}
+
+#[test]
+fn touch_screen_pen_up_and_down() {
+    let mut nds = Nds::new();
+    assert_eq!((tsc(&mut nds, 5), tsc(&mut nds, 1)), (0x000, 0xFFF), "stylet levé");
+    assert_ne!(nds.bus7().read16(0x0400_0136) & (1 << 6), 0);
+
+    for (x, y) in [(0u8, 0u8), (128, 96), (255, 191), (37, 150)] {
+        nds.set_touch(Some((x, y)));
+        assert_eq!(nds.bus7().read16(0x0400_0136) & (1 << 6), 0, "EXTKEYIN : stylet posé");
+        let (ax, ay) = (tsc(&mut nds, 5), tsc(&mut nds, 1));
+        let px = adc_to_pixel(ax, 0x200, 0x20, 0xE00, 0xE0);
+        let py = adc_to_pixel(ay, 0x300, 0x20, 0xD00, 0xA0);
+        assert!((px - x as i32).abs() <= 1 && (py - y as i32).abs() <= 1, "({x},{y}) → ({px},{py})");
+    }
+    nds.set_touch(None);
+    assert_eq!(tsc(&mut nds, 1), 0xFFF);
+}
+
+#[test]
+fn touch_screen_pipelined_commands() {
+    let mut nds = Nds::new();
+    nds.set_touch(Some((128, 96)));
+    let x = tsc(&mut nds, 5);
+    // X, puis l'octet haut, puis la commande Y en même temps que l'octet bas.
+    let r = [spi(&mut nds, 2, 0xD0, false), spi(&mut nds, 2, 0, false), spi(&mut nds, 2, 0x90, false)];
+    assert_eq!(((r[1] as u16) << 5) | (r[2] as u16 >> 3), x, "l'octet bas sort pendant la commande suivante");
+    let hi = spi(&mut nds, 2, 0, false);
+    let lo = spi(&mut nds, 2, 0, true);
+    assert_eq!(((hi as u16) << 5) | (lo as u16 >> 3), tsc(&mut nds, 1));
+}
+
+// ======================================================================
+// Horloge
+// ======================================================================
+
+/// Commande RTC pilotée bit à bit par l'ARM7. `msb_first` pour la commande
+/// (comme libnds) ; données toujours LSB d'abord.
+fn rtc(nds: &mut Nds, cmd: u8, msb_first: bool, write: &[u8], read: usize) -> Vec<u8> {
+    let mut bus = nds.bus7();
+    let base = 0x60; // horloge et sélection en sortie
+    let mut put = |v: u32| bus.write8(0x0400_0138, v as u8);
+    put(base | 0x02); // CS bas, /SCK haut
+    put(base | 0x06); // CS haut
+    let send = |put: &mut dyn FnMut(u32), byte: u8, msb: bool| {
+        for bit in 0..8 {
+            let b = if msb { (byte >> (7 - bit)) & 1 } else { (byte >> bit) & 1 } as u32;
+            put(base | 0x14 | b); // /SCK bas, donnée
+            put(base | 0x16 | b); // /SCK haut : échantillonnée
+        }
+    };
+    send(&mut put, cmd, msb_first);
+    for &b in write {
+        send(&mut put, b, false);
+    }
+    let mut out = Vec::new();
+    for _ in 0..read {
+        let mut byte = 0u8;
+        for bit in 0..8 {
+            bus.write8(0x0400_0138, base as u8 | 0x04);
+            bus.write8(0x0400_0138, base as u8 | 0x06);
+            byte |= (bus.read8(0x0400_0138) & 1) << bit;
+        }
+        out.push(byte);
+    }
+    bus.write8(0x0400_0138, base as u8 | 0x02); // CS bas : fin
+    out
+}
+
+#[test]
+fn rtc_date_time_both_bit_orders() {
+    let mut nds = Nds::new();
+    nds.hw.rtc.fixed_time = Some(1_794_939_900); // mardi 17 novembre 2026, 18:25:00 UTC
+    let expected = [0x26, 0x11, 0x17, 2, 0x18 | 0x40, 0x25, 0x00];
+    assert_eq!(rtc(&mut nds, 0x65, true, &[], 7), expected, "commande MSB d'abord (libnds)");
+    // 0x65 envoyé MSB d'abord = 0xA6 envoyé LSB d'abord : même train de
+    // bits. Le cas réellement différent : 0x65 décalé LSB d'abord.
+    assert_eq!(rtc(&mut nds, 0xA6, false, &[], 7), expected, "même train de bits");
+    assert_eq!(rtc(&mut nds, 0x65, false, &[], 7), expected, "code 0110 reçu en dernier");
+    assert_eq!(rtc(&mut nds, 0x67, true, &[], 3), expected[4..], "heure seule");
+    assert_eq!(rtc(&mut nds, 0x61, true, &[], 1), [0x02], "status1 : mode 24 h");
+}
+
+#[test]
+fn rtc_write_sets_an_offset() {
+    let mut nds = Nds::new();
+    nds.hw.rtc.fixed_time = Some(1_794_939_900);
+    // Écrire 2027-01-02 03:04:05 (date et heure).
+    rtc(&mut nds, 0x64, true, &[0x27, 0x01, 0x02, 6, 0x03, 0x04, 0x05], 0);
+    assert_eq!(rtc(&mut nds, 0x65, true, &[], 7), [0x27, 0x01, 0x02, 6, 0x03, 0x04, 0x05]);
+    nds.hw.rtc.fixed_time = Some(1_794_939_900 + 61);
+    assert_eq!(rtc(&mut nds, 0x67, true, &[], 3), [0x03, 0x05, 0x06], "l'horloge continue d'avancer");
+}
+
+#[test]
+fn direct_boot_keeps_firmware_and_uses_its_settings() {
+    let mut nds = Nds::new();
+    let mut fw = crate::nds::synthetic_firmware();
+    // Copie 1 plus récente (compteur 2) avec la couleur favorite 3.
+    let base = 0x3FF00;
+    fw[base + 2] = 3;
+    fw[base + 0x70] = 2;
+    let crc = crc16(0xFFFF, fw[base..base + 0x70].iter().copied());
+    fw[base + 0x72..base + 0x74].copy_from_slice(&crc.to_le_bytes());
+    nds.load_firmware(&fw);
+    nds.hw.rtc.fixed_time = Some(123);
+    nds.set_touch(Some((1, 2)));
+    nds.direct_boot(include_bytes!("../../tests/roms/boot_test.nds").to_vec()).unwrap();
+    assert_eq!(nds.bus9().read8(0x027F_FC82), 3, "réglages pris dans la copie la plus récente");
+    assert_eq!(nds.hw.spi.firmware.data[base + 2], 3, "firmware conservé");
+    assert_eq!(nds.hw.rtc.fixed_time, Some(123));
+    assert_eq!(nds.hw.spi.touch.pen, Some((1, 2)));
+    // CRC faux : on retombe sur l'autre copie (couleur 11).
+    let mut bad = fw.clone();
+    bad[base + 0x72] ^= 1;
+    nds.load_firmware(&bad);
+    nds.direct_boot(include_bytes!("../../tests/roms/boot_test.nds").to_vec()).unwrap();
+    assert_eq!(nds.bus9().read8(0x027F_FC82), 11);
+}
+
+// ======================================================================
+// Puce de sauvegarde et détection
+// ======================================================================
+
+use crate::nds::spimem::Family;
+
+/// Une transaction sur le SPI de la cartouche, comme libnds : slot activé
+/// en mode SPI avec « hold », puis AUXSPICNT réécrit pour relâcher la puce.
+fn aux(nds: &mut Nds, send: &[u8], receive: usize) -> Vec<u8> {
+    let mut bus = nds.bus9();
+    bus.write16(0x0400_01A0, 0xA040);
+    let mut out = Vec::new();
+    for i in 0..send.len() + receive {
+        bus.write8(0x0400_01A2, send.get(i).copied().unwrap_or(0));
+        let r = bus.read8(0x0400_01A2);
+        if i >= send.len() {
+            out.push(r);
+        }
+    }
+    bus.write16(0x0400_01A0, 0x0040);
+    out
+}
+
+fn aux_write(nds: &mut Nds, header: &[u8], data: &[u8]) {
+    aux(nds, &[0x06], 0);
+    let mut tx = header.to_vec();
+    tx.extend_from_slice(data);
+    aux(nds, &tx, 0);
+}
+
+fn pattern(n: usize, seed: u8) -> Vec<u8> {
+    (0..n).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect()
+}
+
+fn locked(nds: &Nds) -> Option<(Family, usize)> {
+    nds.hw.slot1.save.locked()
+}
+
+#[test]
+fn save_eeprom_8k_detected_on_first_write() {
+    let mut nds = Nds::new();
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x40], 8), [0xFF; 8], "vierge : 0xFF sans avoir choisi");
+    assert_eq!(locked(&nds), None, "les lectures ne verrouillent rien");
+    let data = pattern(32, 1);
+    aux_write(&mut nds, &[0x02, 0x00, 0x40], &data);
+    assert_eq!(locked(&nds), Some((Family::Eeprom16, 8 << 10)));
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x40], 32), data);
+    assert_eq!(aux(&mut nds, &[0x05], 1), [0x00], "WEL retombé après l'écriture");
+    assert!(nds.save_dirty());
+    assert_eq!(nds.save_data().unwrap().len(), 8 << 10);
+}
+
+#[test]
+fn save_eeprom_64k_grows_with_addresses() {
+    let mut nds = Nds::new();
+    let data = pattern(128, 2);
+    aux_write(&mut nds, &[0x02, 0x80, 0x00], &data);
+    assert_eq!(locked(&nds), Some((Family::Eeprom16, 64 << 10)));
+    assert_eq!(aux(&mut nds, &[0x03, 0x80, 0x00], 128), data);
+}
+
+#[test]
+fn save_eeprom_512_high_half_via_opcode() {
+    let mut nds = Nds::new();
+    let data = pattern(16, 3);
+    aux_write(&mut nds, &[0x0A, 0x10], &data); // WRHI : adresse 0x110
+    assert_eq!(locked(&nds), Some((Family::Eeprom512, 512)));
+    assert_eq!(aux(&mut nds, &[0x0B, 0x10], 16), data, "RDHI");
+    assert_eq!(aux(&mut nds, &[0x03, 0x10], 1), [0xFF], "RDLO : l'autre moitié");
+    assert_eq!(aux(&mut nds, &[0x05], 1), [0xF0], "bits 4–7 à 1 sur la 0,5 Ko");
+    assert_eq!(nds.save_data().unwrap()[0x110..0x120], data[..]);
+}
+
+#[test]
+fn save_flash_rdid_erase_and_program() {
+    let mut nds = Nds::new();
+    assert_eq!(aux(&mut nds, &[0x9F], 3), [0x20, 0x40, 0x12], "RDID : FLASH en tête");
+    aux(&mut nds, &[0x06], 0);
+    aux(&mut nds, &[0xD8, 0x01, 0x00, 0x00], 0); // effacement de secteur
+    assert_eq!(locked(&nds), Some((Family::Flash, 256 << 10)), "l'effacement n'existe qu'en FLASH");
+    let data = pattern(256, 4);
+    aux_write(&mut nds, &[0x0A, 0x01, 0x00, 0x00], &data);
+    assert_eq!(aux(&mut nds, &[0x03, 0x01, 0x00, 0x00], 256), data);
+    assert_eq!(aux(&mut nds, &[0x0B, 0x01, 0x00, 0x10, 0x00], 4), data[0x10..0x14], "FAST READ");
+    aux_write(&mut nds, &[0x02, 0x01, 0x00, 0x00], &[0x0F]);
+    assert_eq!(aux(&mut nds, &[0x03, 0x01, 0x00, 0x00], 1), [data[0] & 0x0F], "PP : ET logique");
+}
+
+#[test]
+fn save_flash_page_write_from_blank() {
+    let mut nds = Nds::new();
+    aux_write(&mut nds, &[0x0A, 0x00, 0x02, 0x00], &pattern(256, 5));
+    assert_eq!(locked(&nds).map(|l| l.0), Some(Family::Flash), "260 octets : 3 + 256, pas 2 + 257");
+}
+
+#[test]
+fn save_probe_as_8k_then_use_512() {
+    // Cas signalé par GBATEK (Over the Hedge) : sondage en 16 bits, puis
+    // utilisation d'une EEPROM de 0,5 Ko.
+    let mut nds = Nds::new();
+    aux(&mut nds, &[0x03, 0x00, 0x00], 8);
+    aux_write(&mut nds, &[0x02, 0x20], &pattern(16, 0x11));
+    assert_eq!(locked(&nds), Some((Family::Eeprom512, 512)));
+    assert_eq!(aux(&mut nds, &[0x03, 0x20], 16), pattern(16, 0x11));
+}
+
+#[test]
+fn save_read_dummy_run_reveals_address_width() {
+    let mut nds = Nds::new();
+    // 3 octets d'adresse non nuls puis des octets factices : pas une EEPROM 16 bits.
+    // 15 octets lus : la puissance de 2 favoriserait la lecture 2 + 16.
+    aux(&mut nds, &[0x03, 0x01, 0x02, 0x03], 15);
+    assert_eq!(locked(&nds), None);
+    assert_eq!(nds.hw.slot1.save.leading(), Family::Flash);
+}
+
+#[test]
+fn save_odd_sized_struct_write_stays_eeprom() {
+    // 17 octets en 0x0010, 1er octet nul : lu « 3 + 16, aligné », ce serait
+    // une FLASH. Mais un 02 sans effacement préalable désigne une EEPROM.
+    let mut nds = Nds::new();
+    let mut data = pattern(17, 9);
+    data[0] = 0;
+    aux_write(&mut nds, &[0x02, 0x00, 0x10], &data);
+    assert_eq!(locked(&nds).map(|l| l.0), Some(Family::Eeprom16));
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x10], 17), data);
+}
+
+#[test]
+fn save_page_crossing_rules_out_a_family() {
+    // Écriture 0A de 16 octets : en FLASH (3 + 13 à 0x10F8F8), elle
+    // franchirait une page de 256 ; reste l'EEPROM de 0,5 Ko (0x110 + 16).
+    let mut nds = Nds::new();
+    let mut data = pattern(16, 10);
+    data[0] = 0xF8;
+    data[1] = 0xF8;
+    aux_write(&mut nds, &[0x0A, 0x10], &data);
+    assert_eq!(locked(&nds).map(|l| l.0), Some(Family::Eeprom512));
+}
+
+#[test]
+fn save_exact_size_is_trusted_except_512k() {
+    // 8 Ko dont seuls 0x100–0x1FF sont utilisés : une EEPROM 16 bits, pas
+    // une 0,5 Ko (l'étendue seule le suggérerait).
+    let mut file = vec![0xFF; 8 << 10];
+    file[0x100..0x200].fill(0x42);
+    let mut nds = Nds::new();
+    nds.load_save(&file);
+    assert_eq!(locked(&nds), Some((Family::Eeprom16, 8 << 10)));
+    // La même chose à 512 Ko reste ambiguë.
+    file.resize(512 << 10, 0xFF);
+    nds.load_save(&file);
+    assert_eq!(locked(&nds), None);
+}
+
+#[test]
+fn save_eeprom_game_probing_rdid_gets_ff() {
+    // Trois lectures « 2 + 16 » : l'EEPROM 16 bits mène nettement. Un
+    // RDID ensuite reçoit FF FF FF, comme d'une vraie EEPROM.
+    let mut nds = Nds::new();
+    for _ in 0..3 {
+        aux(&mut nds, &[0x03, 0x00, 0x10], 16);
+    }
+    assert_eq!(nds.hw.slot1.save.leading(), Family::Eeprom16);
+    assert_eq!(aux(&mut nds, &[0x9F], 3), [0xFF; 3]);
+}
+
+#[test]
+fn save_write_without_wren_is_ignored() {
+    let mut nds = Nds::new();
+    aux(&mut nds, &[0x02, 0x00, 0x00, 1, 2, 3, 4], 0);
+    assert_eq!(locked(&nds), None);
+    assert_eq!(nds.save_data(), None, "rien à sauvegarder");
+}
+
+#[test]
+fn save_padded_import_keeps_eeprom_and_reads_right() {
+    // Comme les .sav complétés à 512 Ko : données sur moins de 8 Ko.
+    let mut file = vec![0xFF; 512 << 10];
+    let data = pattern(0x1DC8, 6);
+    file[..data.len()].copy_from_slice(&data);
+    let mut nds = Nds::new();
+    nds.load_save(&file);
+    assert_eq!(locked(&nds), None, "ambigu : on ne verrouille pas");
+    assert_eq!(nds.hw.slot1.save.leading(), Family::Eeprom16, "a priori : plus petite famille");
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x10], 16), data[0x10..0x20]);
+    aux_write(&mut nds, &[0x02, 0x00, 0x00], &[9; 32]);
+    assert_eq!(locked(&nds), Some((Family::Eeprom16, 8 << 10)));
+    let out = nds.save_data().unwrap();
+    assert_eq!(out.len(), 8 << 10, "réexporté à la vraie taille");
+    assert_eq!(out[32..data.len()], data[32..]);
+}
+
+#[test]
+fn save_large_import_locks_flash_at_once() {
+    let mut file = vec![0xFF; 512 << 10];
+    file[0x7F000..0x7F010].copy_from_slice(&pattern(16, 7));
+    let mut nds = Nds::new();
+    nds.load_save(&file);
+    assert_eq!(locked(&nds), Some((Family::Flash, 512 << 10)), "données au-delà de 128 Ko");
+    assert_eq!(aux(&mut nds, &[0x03, 0x07, 0xF0, 0x00], 16), pattern(16, 7));
+    assert_eq!(aux(&mut nds, &[0x9F], 3), [0x20, 0x40, 0x13], "M45PE40");
+}
+
+#[test]
+fn save_write_protection() {
+    let mut nds = Nds::new();
+    aux_write(&mut nds, &[0x02, 0x00, 0x00], &[1; 32]);
+    aux(&mut nds, &[0x06], 0);
+    aux(&mut nds, &[0x01, 0x0C], 0); // WRSR : tout protégé
+    assert_eq!(aux(&mut nds, &[0x05], 1), [0x0C]);
+    aux_write(&mut nds, &[0x02, 0x00, 0x00], &[2; 32]);
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x00], 1), [1], "écriture refusée");
+}
+
+#[test]
+fn save_hold_bit_ends_transaction_per_byte() {
+    // Sans « hold », la puce est relâchée après chaque octet.
+    let mut nds = Nds::new();
+    aux_write(&mut nds, &[0x02, 0x00, 0x00], &[5; 32]);
+    {
+        let mut bus = nds.bus9();
+        bus.write16(0x0400_01A0, 0xA000);
+        bus.write8(0x0400_01A2, 0x06); // WREN, transaction finie
+        bus.write8(0x0400_01A2, 0x05); // nouvelle transaction : RDSR
+    }
+    let mut bus = nds.bus9();
+    bus.write16(0x0400_01A0, 0xA040);
+    bus.write8(0x0400_01A2, 0x05);
+    bus.write8(0x0400_01A2, 0x00);
+    assert_eq!(bus.read8(0x0400_01A2), 0x02, "WEL posé par le WREN isolé");
+}
+
+#[test]
+fn save_survives_direct_boot_and_forced_type() {
+    let mut nds = Nds::new();
+    aux_write(&mut nds, &[0x02, 0x00, 0x00], &[7; 32]);
+    nds.direct_boot(include_bytes!("../../tests/roms/boot_test.nds").to_vec()).unwrap();
+    assert_eq!(locked(&nds), Some((Family::Eeprom16, 8 << 10)), "la puce est sur la cartouche");
+    assert_eq!(aux(&mut nds, &[0x03, 0x00, 0x00], 2), [7, 7]);
+
+    let mut nds = Nds::new();
+    nds.force_save_type(Family::Flash, 1 << 20, &[]);
+    assert_eq!(aux(&mut nds, &[0x9F], 3), [0x20, 0x40, 0x14]);
+}
+
+/// Les .sav réels de Yassine (non versionnés) : `AVXDS_SAVES=dossier`.
+#[test]
+fn real_save_files_if_present() {
+    let Ok(dir) = std::env::var("AVXDS_SAVES") else { return };
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let file = std::fs::read(&path).unwrap();
+        let extent = file.iter().rposition(|&b| b != 0xFF).map_or(0, |p| p + 1);
+        let mut nds = Nds::new();
+        nds.load_save(&file);
+        let lead = nds.hw.slot1.save.leading();
+        eprintln!("{} : {} o, données jusqu'à 0x{extent:X}, {:?}, en tête {lead:?}",
+            path.display(), file.len(), locked(&nds), );
+        // Relecture de 64 octets au début des données, sous l'hypothèse en tête.
+        let hl = lead.header_len(0x03);
+        let start = file.iter().position(|&b| b != 0xFF).unwrap_or(0) & !0xFF;
+        let addr = (start as u32).to_be_bytes();
+        let mut cmd = vec![0x03];
+        cmd.extend_from_slice(&addr[4 - hl..]);
+        assert_eq!(aux(&mut nds, &cmd, 64), file[start..start + 64], "{}", path.display());
+        if locked(&nds).is_some() {
+            assert_eq!(nds.save_data().unwrap(), file, "aller-retour exact");
+        }
+    }
+}
+
+#[test]
+fn chip_id_size_byte_and_protocol_bit() {
+    let rom = include_bytes!("../../tests/roms/boot_test.nds");
+    let mut header = crate::nds::Header::parse(rom).unwrap();
+    let id = |h: &crate::nds::Header, cap: u8| {
+        let mut h = h.clone();
+        h.device_capacity = cap;
+        crate::nds::cart::chip_id(&h, 0)
+    };
+    // Capacité de l'en-tête : 128 Ko << n.
+    assert_eq!(id(&header, 6), 0x0000_07C2, "8 Mo");
+    assert_eq!(id(&header, 9), 0x0000_3FC2, "64 Mo : ancien protocole");
+    assert_eq!(id(&header, 10), 0x8000_7FC2, "128 Mo");
+    assert_eq!(id(&header, 11), 0x8000_FFC2, "256 Mo (exemple GBATEK : C2h,FFh)");
+    assert_eq!(id(&header, 12), 0x8000_FEC2, "512 Mo (exemple GBATEK : C2h,FEh)");
+    header.device_capacity = 0;
+    assert_eq!(crate::nds::cart::chip_id(&header, 300 << 20), 0x8000_FEC2, "fichier plus grand que l'en-tête");
+}
+
+#[test]
+fn ipc_trace_keeps_head_and_tail() {
+    let mut t = crate::nds::IoTrace::default();
+    for i in 0..600u32 {
+        t.record(i as u64, CpuId::Arm9, 0x0200_0000, 0x0400_0188, true, i);
+    }
+    assert_eq!(t.ipc.len(), 256);
+    assert_eq!(t.ipc_tail.len(), 256);
+    assert_eq!(t.ipc_dropped, 600 - 512);
+    assert_eq!(t.ipc[0].5, 0, "début conservé");
+    assert_eq!(t.ipc_tail.back().unwrap().5, 599, "fin conservée");
+    // Une boucle « écrire, lire » ne prend que deux lignes.
+    let mut t = crate::nds::IoTrace::default();
+    for _ in 0..1000 {
+        t.record(0, CpuId::Arm7, 0x10, 0x0400_0180, true, 0x700);
+        t.record(0, CpuId::Arm7, 0x14, 0x0400_0180, false, 0x700);
+    }
+    assert_eq!(t.ipc.len(), 2);
+    assert_eq!((t.ipc[0].6, t.ipc[1].6), (1000, 1000));
+}
+
+// Cartouches à infrarouge (Pokémon N2) : préfixe 00h devant chaque commande
+// de la sauvegarde, comme le fait le code ARM7 du jeu.
+fn aux_ir(nds: &mut Nds, send: &[u8], receive: usize) -> Vec<u8> {
+    let mut tx = vec![0x00];
+    tx.extend_from_slice(send);
+    aux(nds, &tx, receive)
+}
+
+#[test]
+fn save_through_infrared_prefix() {
+    let mut nds = Nds::new();
+    assert_eq!(aux_ir(&mut nds, &[0x05], 1), [0x00], "RDSR via le préfixe : prête, pas FF");
+    assert!(nds.hw.slot1.infrared);
+    aux_ir(&mut nds, &[0x06], 0);
+    assert_eq!(aux_ir(&mut nds, &[0x05], 1), [0x02], "WEL vu à travers le préfixe");
+    let data = pattern(256, 12);
+    let mut tx = vec![0x0A, 0x01, 0x00, 0x00];
+    tx.extend_from_slice(&data);
+    aux_ir(&mut nds, &tx, 0);
+    assert_eq!(locked(&nds).map(|l| l.0), Some(Family::Flash));
+    assert_eq!(aux_ir(&mut nds, &[0x03, 0x01, 0x00, 0x00], 256), data);
+    // Une commande sans préfixe va à la puce infrarouge, pas à la sauvegarde.
+    aux(&mut nds, &[0x06], 0);
+    aux(&mut nds, &[0x0A, 0x01, 0x00, 0x00, 0x55], 0);
+    assert_eq!(aux_ir(&mut nds, &[0x03, 0x01, 0x00, 0x00], 1), [data[0]], "sauvegarde intacte");
+}
+
+#[test]
+fn infrared_prefix_split_across_hold_writes() {
+    // Séquence exacte du jeu : 00 (hold, horloge lente), AUXSPICNT
+    // réécrit avec hold, 05, puis AUXSPICNT sans hold et 00.
+    let mut nds = Nds::new();
+    let mut bus = nds.bus7();
+    bus.write16(0x0400_01A0, 0xA040);
+    bus.write16(0x0400_01A0, 0xA042);
+    bus.write16(0x0400_01A2, 0x00);
+    bus.write16(0x0400_01A0, 0xA040);
+    bus.write16(0x0400_01A2, 0x05);
+    bus.write16(0x0400_01A0, 0xA000);
+    bus.write16(0x0400_01A2, 0x00);
+    assert_eq!(bus.read16(0x0400_01A2), 0x00, "statut : prête");
+}
+
+#[test]
+fn gpu3d_idle_engine_reports_an_empty_fifo() {
+    let mut nds = Nds::new();
+    let st = nds.bus9().read32(0x0400_0600);
+    assert_ne!(st & (1 << 25), 0, "moins qu'à moitié pleine");
+    assert_ne!(st & (1 << 26), 0, "vide");
+    assert_eq!(st & (1 << 27), 0, "pas occupé");
+    assert_eq!((st >> 16) & 0x1FF, 0, "0 entrée");
+    // Commandes acceptées sans être notées comme I/O manquantes.
+    nds.bus9().write32(0x0400_0400, 0x0000_0015);
+    nds.bus9().write32(0x0400_0540, 0);
+    assert!(nds.hw.unhandled_io.is_empty(), "{:x?}", nds.hw.unhandled_io);
+    assert!(nds.hw.gpu.unsupported.iter().any(|n| n.starts_with("3D")));
+    // L'ARM7 garde ses registres de son à ces adresses : l'écriture de
+    // l'ARM9 n'y est pas arrivée, celle de l'ARM7 si.
+    assert_eq!(nds.bus7().read32(0x0400_0400), 0);
+    nds.bus7().write32(0x0400_0400, 0x0000_0015);
+    assert_eq!(nds.bus7().read32(0x0400_0400), 0x15);
+    assert!(nds.hw.unhandled_io.is_empty(), "{:x?}", nds.hw.unhandled_io);
+}
+
+#[test]
+fn gpu3d_fifo_irq_is_level_triggered() {
+    let mut nds = Nds::new();
+    nds.bus9().write32(0x0400_0600, 2 << 30); // IRQ quand la file est vide
+    assert_eq!(nds.bus9().read32(0x0400_0600) >> 30, 2);
+    assert_ne!(nds.hw.irq9.if_ & irq_bits::GEOMETRY_FIFO, 0);
+    nds.hw.irq9.if_ = 0; // acquittement
+    nds.run_frame();
+    assert_ne!(nds.hw.irq9.if_ & irq_bits::GEOMETRY_FIFO, 0, "reposée tant que la file est vide");
+    nds.bus9().write32(0x0400_0600, 0);
+    nds.hw.irq9.if_ = 0;
+    nds.run_frame();
+    assert_eq!(nds.hw.irq9.if_ & irq_bits::GEOMETRY_FIFO, 0, "plus d'IRQ en mode 0");
+}
+
+/// Entrées produites par une suite de mots écrits dans GXFIFO.
+fn unpack(words: &[u32]) -> Vec<(u8, u32)> {
+    let mut u = gpu3d::fifo::Unpacker::default();
+    let mut out = Vec::new();
+    for &w in words {
+        u.feed(w, &mut |e| out.push((e.cmd, e.param)));
+    }
+    out
+}
+
+#[test]
+fn gxfifo_packed_commands_take_their_parameters_in_order() {
+    // MTX_MODE (1 param), MTX_PUSH (0), MTX_TRANS (3) ; puis un mot neuf.
+    let e = unpack(&[0x001C_1110, 2, 0xA, 0xB, 0xC, 0x0000_0015]);
+    assert_eq!(e, vec![(0x10, 2), (0x11, 0), (0x1C, 0xA), (0x1C, 0xB), (0x1C, 0xC), (0x15, 0)]);
+    // Codes 00h et invalides ignorés, sans consommer de paramètre ; seuls
+    // les codes invalides sont comptés comme tels.
+    let e = unpack(&[0x10FF_0015, 3, 0x0000_0041]);
+    assert_eq!(e, vec![(0x15, 0), (0x10, 3), (0x41, 0)]);
+    let mut u = gpu3d::fifo::Unpacker::default();
+    u.feed(0x10FF_0015, &mut |_| {});
+    assert_eq!(u.invalid, 1, "FFh invalide, 00h = pas de commande");
+    // Exemple GBATEK : Packed(00151515h) = trois MTX_IDENTITY.
+    assert_eq!(unpack(&[0x0015_1515]), vec![(0x15, 0); 3]);
+    // Format non compact : un code, puis ses 16 paramètres.
+    let mut words = vec![0x16];
+    words.extend(1..=16);
+    let e = unpack(&words);
+    assert_eq!(e.len(), 16);
+    assert!(e.iter().zip(1..).all(|(&(c, p), k)| c == 0x16 && p == k));
+}
+
+#[test]
+fn gxfifo_fills_the_pipe_first_and_refills_it_two_by_two() {
+    use gpu3d::fifo::{CommandFifo, Entry};
+    let mut f = CommandFifo::default();
+    for k in 0..6 {
+        assert!(f.push(Entry { cmd: 0x20, param: k }));
+    }
+    assert_eq!((f.pipe_len(), f.fifo_len()), (4, 2), "4 au PIPE, le reste à la FIFO");
+    assert_eq!(f.pop().map(|e| e.param), Some(0));
+    assert_eq!((f.pipe_len(), f.fifo_len()), (3, 2), "PIPE à 3 : pas encore de transfert");
+    // PIPE non plein mais FIFO non vide : l'entrée va en FIFO (l'ordre tient).
+    assert!(f.push(Entry { cmd: 0x20, param: 6 }));
+    assert_eq!((f.pipe_len(), f.fifo_len()), (3, 3));
+    assert_eq!(f.pop().map(|e| e.param), Some(1));
+    assert_eq!((f.pipe_len(), f.fifo_len()), (4, 1), "PIPE sous 3 : 2 entrées montent");
+    for k in 2..7 {
+        assert_eq!(f.pop().map(|e| e.param), Some(k), "ordre conservé");
+    }
+    assert!(f.pop().is_none());
+    // 4 + 256 entrées au plus.
+    for k in 0..260 {
+        assert!(f.push(Entry { cmd: 0x20, param: k }));
+    }
+    assert!(f.is_full());
+    assert!(!f.push(Entry { cmd: 0x20, param: 0 }));
+}
+
+#[test]
+fn gpu3d_commands_keep_the_engine_busy_for_their_duration() {
+    let mut g = gpu3d::Gpu3d::default();
+    g.write(0x0400_0454, 0, !0, 1000); // MTX_IDENTITY : 19 cycles de bus
+    assert_ne!(g.read(0x0400_0600, 1000) & (1 << 27), 0, "occupé");
+    assert_ne!(g.read(0x0400_0600, 1000 + 37) & (1 << 27), 0, "encore occupé");
+    assert_eq!(g.read(0x0400_0600, 1000 + 38) & (1 << 27), 0, "libre après 19 × 2 cycles ARM9");
+    // MTX_MULT_4x3 : 31 cycles, 61 en mode 2 ; la commande attend ses 12
+    // paramètres avant de s'exécuter.
+    g.write(0x0400_0440, 2, !0, 2000); // MTX_MODE 2
+    for k in 0..11 {
+        g.write(0x0400_0464, k, !0, 2000);
+    }
+    assert_ne!(g.read(0x0400_0600, 5000) & (1 << 27), 0, "attend son 12e paramètre");
+    g.write(0x0400_0464, 11, !0, 5000);
+    assert_ne!(g.read(0x0400_0600, 5000 + 121) & (1 << 27), 0);
+    assert_eq!(g.read(0x0400_0600, 5000 + 122) & (1 << 27), 0, "61 × 2 cycles");
+    assert_eq!(g.stats.commands[0x19], 1);
+    // Trois commandes reçues au même instant : une seule s'exécute tout de
+    // suite, les autres attendent leur tour sur l'horloge du moteur.
+    for _ in 0..3 {
+        g.write(0x0400_0454, 0, !0, 10_000);
+    }
+    assert_eq!(g.read(0x0400_0600, 10_000) & (1 << 27), 1 << 27);
+    assert_eq!(g.stats.commands[0x15], 2, "la 1re de cette série seulement (+1 plus haut)");
+    g.read(0x0400_0600, 10_000 + 3 * 38);
+    assert_eq!(g.stats.commands[0x15], 4);
+    // Port d'une commande inexistante (1Dh) : ignoré.
+    g.write(0x0400_0474, 0, !0, 20_000);
+    assert_eq!(g.read(0x0400_0600, 20_000) & (1 << 27), 0);
+}
+
+#[test]
+fn gpu3d_swap_buffers_halts_the_engine_until_vblank() {
+    let mut nds = Nds::new();
+    nds.run_frame(); // au début du VBlank : une image entière devant nous
+    nds.bus9().write32(0x0400_0540, 0); // SWAP_BUFFERS
+    for k in 0..300 {
+        nds.bus9().write32(0x0400_0480, k); // COLOR
+    }
+    let st = nds.bus9().read32(0x0400_0600);
+    assert_eq!((st >> 16) & 0x1FF, 256, "FIFO pleine (bit 24)");
+    assert_eq!(st & (3 << 25), 0, "ni à moitié vide, ni vide");
+    assert_ne!(st & (1 << 27), 0, "occupé : attend le VBlank");
+    assert_eq!(nds.hw.gpu3d.fifo.reserve_len(), 300 - 256 - 4, "le surplus attend hors file");
+    nds.run_frame(); // VBlank suivant : l'échange a lieu, le moteur repart
+    assert_eq!(nds.hw.gpu3d.last_frame.swaps, 1);
+    for _ in 0..4 {
+        nds.step(); // quelques instructions : le moteur rattrape l'horloge
+    }
+    nds.run_until(nds.now + 2 * LINE_CYCLES);
+    let st = nds.bus9().read32(0x0400_0600);
+    assert_ne!(st & (1 << 26), 0, "file vidée");
+    assert_eq!(st & (1 << 27), 0);
+    assert_eq!(nds.hw.gpu3d.stats.commands[0x20], 300, "toutes les couleurs exécutées");
+}
+
+#[test]
+fn gpu3d_geometry_dma_sends_bursts_while_the_fifo_is_half_empty() {
+    let mut nds = Nds::new();
+    nds.run_frame();
+    // En mémoire : SWAP_BUFFERS, puis 299 COLOR, en format non compact.
+    let base = 0x0200_0000;
+    let mut words = vec![0x50, 0];
+    for k in 0..299 {
+        words.extend([0x20, k]);
+    }
+    for (i, w) in words.iter().enumerate() {
+        nds.bus9().write32(base + 4 * i as u32, *w);
+    }
+    // DMA0 : mode 7, mots de 32 bits, destination fixe, IRQ à la fin.
+    nds.bus9().write32(0x0400_00B0, base);
+    nds.bus9().write32(0x0400_00B4, 0x0400_0400);
+    nds.bus9().write32(0x0400_00B8, 0xC000_0000 | 7 << 27 | 1 << 26 | 2 << 21 | words.len() as u32);
+    // Le moteur s'arrête sur SWAP_BUFFERS : la DMA remplit la FIFO par
+    // rafales de 112 mots tant qu'elle est à moins de moitié pleine.
+    let ch = nds.hw.dma[0].ch[0];
+    assert!(ch.enabled(), "transfert pas fini");
+    assert_eq!(ch.left, 600 - 3 * 112, "trois rafales");
+    let st = nds.bus9().read32(0x0400_0600);
+    assert!((st >> 16) & 0x1FF >= 128, "plus à moitié vide : la DMA attend");
+    assert_eq!(nds.hw.irq9.if_ & irq_bits::DMA0, 0);
+    nds.run_frame(); // VBlank : échange, le moteur vide la file, la DMA reprend
+    nds.run_until(nds.now + 4 * LINE_CYCLES);
+    assert!(!nds.hw.dma[0].ch[0].enabled(), "transfert terminé");
+    assert_ne!(nds.hw.irq9.if_ & irq_bits::DMA0, 0, "IRQ de fin");
+    assert_eq!(nds.hw.gpu3d.stats.commands[0x20], 299);
+}
+
+#[test]
+fn gpu3d_full_fifo_runs_the_engine_ahead_instead_of_dropping() {
+    // Sans SwapBuffers, une file pleine fait avancer le moteur (le CPU
+    // attendrait sur la console) : rien ne part en réserve.
+    let mut g = gpu3d::Gpu3d::default();
+    for k in 0..400 {
+        g.write(0x0400_0480, k, !0, 50); // COLOR, toutes au même instant
+    }
+    assert_eq!(g.fifo.reserve_len(), 0);
+    assert_eq!(g.stats.stalls, 0);
+    // Le PIPE se recharge par 2 : la FIFO oscille entre 254 et 256.
+    assert!(g.fifo.fifo_len() >= 254, "la FIFO reste pleine ({})", g.fifo.fifo_len());
+    assert!(g.stats.commands[0x20] >= 400 - 260);
+}
+
+#[test]
+fn gpu3d_half_full_threshold_is_128_entries() {
+    // SwapBuffers arrête le moteur ; puis k COLOR : 4 au PIPE, k − 4 en FIFO.
+    let fill = |k: u32| {
+        let mut g = gpu3d::Gpu3d::default();
+        g.write(0x0400_0540, 0, !0, 0);
+        for c in 0..k {
+            g.write(0x0400_0480, c, !0, 0);
+        }
+        g
+    };
+    let mut g = fill(4 + 127);
+    let st = g.read(0x0400_0600, 0);
+    assert_eq!((st >> 16) & 0x1FF, 127);
+    assert_ne!(st & (1 << 25), 0, "127 : moins de moitié");
+    assert!(g.wants_dma());
+    g.write(0x0400_0600, 1 << 30, !0, 0);
+    assert!(g.irq_pending(), "IRQ mode 1 : moins de moitié pleine");
+    g.write(0x0400_0600, 2 << 30, !0, 0);
+    assert!(!g.irq_pending(), "IRQ mode 2 : la FIFO n'est pas vide");
+    let mut g = fill(4 + 128);
+    let st = g.read(0x0400_0600, 0);
+    assert_eq!((st >> 16) & 0x1FF, 128);
+    assert_eq!(st & (1 << 25), 0, "128 : la moitié, plus « moins de moitié »");
+    assert!(!g.wants_dma());
+    g.write(0x0400_0600, 1 << 30, !0, 0);
+    assert!(!g.irq_pending());
+}
+
+#[test]
+fn gpu3d_geometry_registers_seen_from_the_bus() {
+    let mut nds = Nds::new();
+    nds.run_frame();
+    let mut bus = nds.bus9();
+    bus.write32(0x0400_0440, 1); // MTX_MODE position
+    bus.write32(0x0400_0470, 0x1000); // MTX_TRANS x + 1.0
+    bus.write32(0x0400_0470, 0);
+    bus.write32(0x0400_0470, 0);
+    bus.write32(0x0400_0444, 0); // MTX_PUSH
+    bus.write32(0x0400_04A4, 0xC0 | 31 << 16); // POLYGON_ATTR
+    bus.write32(0x0400_0500, 0); // BEGIN_VTXS triangles
+    for (x, y) in [(-0x1800i32, 0), (-0x800, 0), (-0x1800, 0x800)] {
+        bus.write32(0x0400_048C, (x as u32 & 0xFFFF) | (y as u32) << 16);
+        bus.write32(0x0400_048C, 0);
+    }
+    bus.write32(0x0400_05C4, 0); // POS_TEST (0, 0, 0)
+    bus.write32(0x0400_05C4, 0);
+    // Le temps n'avance pas entre deux accès du test : on laisse passer
+    // quelques lignes pour que le moteur exécute la file.
+    nds.run_until(nds.now + 4 * LINE_CYCLES);
+    let mut bus = nds.bus9();
+    let st = bus.read32(0x0400_0600);
+    assert_eq!(st & (1 << 27), 0, "file exécutée");
+    assert_eq!(st >> 8 & 31, 1, "niveau de pile 1");
+    assert_eq!(bus.read32(0x0400_0604), 1 | 3 << 16, "RAM_COUNT : 1 polygone, 3 sommets");
+    assert_eq!(bus.read32(0x0400_0670), 0x1000, "CLIPMTX m[12] : translation");
+    assert_eq!(bus.read32(0x0400_0620), 0x1000, "POS_RESULT x");
+    assert_eq!(bus.read32(0x0400_062C), 0x1000, "POS_RESULT w");
+    bus.write32(0x0400_0540, 0); // SWAP_BUFFERS
+    nds.run_frame();
+    assert_eq!(nds.hw.gpu3d.geo.rendering.polygons.len(), 1, "livré au rendu au VBlank");
+    assert_eq!(nds.bus9().read32(0x0400_0604), 0, "RAM_COUNT remis à zéro");
+}
+
+#[test]
+fn gpu3d_layer_is_engine_a_bg0() {
+    use crate::nds::gpu3d::render::{Pixel, WIDTH as W3};
+    let mut nds = Nds::new();
+    nds.bus9().write16(0x0400_0304, 0x820F); // écrans, 2D A/B, 3D ; A en haut
+    nds.bus9().write32(0x0400_0000, 0x0001_0109); // mode graphique, BG0 = 3D
+    nds.bus9().write16(0x0500_0000, 0x7C00); // fond (backdrop) bleu
+    nds.run_frame(); // le rendu 3D du VBlank efface le calque
+    // Un pixel rouge opaque, un pixel vert d'alpha 0.
+    let red = Pixel { rgb: [63, 0, 0], alpha: 31 };
+    nds.hw.gpu3d.renderer.color.fill(Pixel { rgb: [0, 63, 0], alpha: 0 });
+    nds.hw.gpu3d.renderer.color[10 * W3 + 20] = red;
+    nds.run_until(nds.now + 192 * LINE_CYCLES); // les lignes visibles, sans le VBlank
+    let top = nds.hw.gpu.screen(0);
+    assert_eq!(top[10 * 256 + 20], 0xFF0000, "pixel 3D en rouge (6 bits ramenés à 5)");
+    assert_eq!(top[10 * 256 + 21], 0x0000FF, "alpha 0 : transparent, le fond passe");
+    // BG0HOFS : la 3D glisse vers la gauche ; 256..511 est transparent.
+    nds.run_frame();
+    nds.hw.gpu3d.renderer.color.fill(Pixel { rgb: [0; 3], alpha: 0 });
+    nds.hw.gpu3d.renderer.color[10 * W3 + 20] = red;
+    nds.bus9().write16(0x0400_0010, 16);
+    nds.run_until(nds.now + 192 * LINE_CYCLES);
+    let top = nds.hw.gpu.screen(0);
+    assert_eq!(top[10 * 256 + 4], 0xFF0000, "décalé de 16");
+    assert_eq!(top[10 * 256 + 20], 0x0000FF);
+    nds.run_frame();
+    nds.hw.gpu3d.renderer.color.fill(Pixel { rgb: [63; 3], alpha: 31 });
+    nds.bus9().write16(0x0400_0010, 300);
+    nds.run_until(nds.now + 192 * LINE_CYCLES);
+    let top = nds.hw.gpu.screen(0);
+    assert_eq!(top[10 * 256], 0x0000FF, "x = 300 : zone transparente");
+    assert_eq!(top[10 * 256 + 255], 0xFFFFFF, "x = 555 → 43 : de nouveau la 3D");
+}
+
+#[test]
+fn gpu3d_commands_to_pixels_end_to_end() {
+    use crate::nds::gpu3d::render::WIDTH as W3;
+    let mut nds = Nds::new();
+    nds.run_frame();
+    let tri = |nds: &mut Nds, swap: u32| {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_04A4, 0xC0 | 31 << 16); // POLYGON_ATTR opaque
+        bus.write32(0x0400_0480, 31); // COLOR rouge
+        bus.write32(0x0400_0500, 0); // BEGIN_VTXS triangles
+        for (x, y) in [(-0x1000i32, -0x1000i32), (0, -0x1000), (-0x1000, 0)] {
+            bus.write32(0x0400_048C, (x as u32 & 0xFFFF) | (y as u32) << 16);
+            bus.write32(0x0400_048C, 0);
+        }
+        bus.write32(0x0400_0540, swap); // SWAP_BUFFERS
+    };
+    nds.bus9().write32(0x0400_0350, 31 << 10); // CLEAR_COLOR bleu, alpha 0
+    nds.bus9().write32(0x0400_0354, 0x7FFF);
+    tri(&mut nds, 2); // bits de cette liste-ci : ceux du SWAP précédent (0)
+    nds.run_until(nds.now + 4 * LINE_CYCLES);
+    nds.run_frame(); // VBlank : échange, puis rendu
+    let r = &nds.hw.gpu3d.renderer;
+    let at = |x: usize, y: usize| y * W3 + x;
+    assert_eq!(r.color[at(10, 180)].rgb, [63, 0, 0], "triangle en bas à gauche");
+    assert_eq!(r.color[at(200, 20)].alpha, 0, "plan arrière, alpha 0");
+    assert_eq!(r.color[at(200, 20)].rgb, [0, 0, 63]);
+    assert_eq!(r.depth[at(10, 180)], 0x80_0000, "tampon Z : z/w = 0 au milieu");
+    // Liste suivante : construite après SWAP_BUFFERS(2), donc tampon W.
+    tri(&mut nds, 0);
+    nds.run_until(nds.now + 4 * LINE_CYCLES);
+    nds.run_frame();
+    assert_eq!(nds.hw.gpu3d.renderer.depth[at(10, 180)], 0x1000, "tampon W : w = 1.0");
+}
+
+// ======================================================================
+// Capture d'écran (DISPCAPCNT)
+// ======================================================================
+
+/// Moteur A en mode graphique, fond uni (backdrop) `color`, banque D en LCDC.
+fn capture_nds(color: u16) -> Nds {
+    let mut nds = gpu_nds();
+    nds.bus9().write32(0x0400_0000, 0x0001_0000); // mode graphique, aucun fond
+    nds.bus9().write16(0x0500_0000, color);
+    nds.bus9().write8(0x0400_0243, 0x80); // VRAMCNT_D : LCDC
+    nds.run_frame();
+    nds
+}
+
+fn bank_d(nds: &Nds, offset: usize) -> u16 {
+    let b = &nds.hw.vram.banks[3];
+    u16::from_le_bytes([b[offset], b[offset + 1]])
+}
+
+const CAP_ON: u32 = 1 << 31;
+const CAP_D_FULL: u32 = 3 << 16 | 3 << 20; // banque D, 256×192
+
+#[test]
+fn capture_copies_the_graphics_screen_into_vram() {
+    let mut nds = capture_nds(0x03E0);
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL);
+    assert_eq!(bank_d(&nds, 0), 0, "rien avant la ligne 0 suivante");
+    nds.run_frame(); // lignes 0..191 capturées, puis bit 31 retombe à 192
+    assert_eq!(bank_d(&nds, 0), 0x83E0, "vert, alpha à 1");
+    assert_eq!(bank_d(&nds, (191 * 256 + 255) * 2), 0x83E0, "dernier pixel");
+    assert_eq!(nds.bus9().read32(0x0400_0064) & CAP_ON, 0, "bit 31 effacé à la ligne 192");
+    // Image suivante : plus de capture.
+    nds.bus9().write16(0x0500_0000, 0x001F);
+    nds.run_frame();
+    assert_eq!(bank_d(&nds, 0), 0x83E0);
+}
+
+#[test]
+fn capture_blends_with_the_previous_vram_image() {
+    let mut nds = capture_nds(0x001F); // rouge 31
+    for o in (0..0x1_8000).step_by(2) {
+        nds.hw.vram.banks[3][o..o + 2].copy_from_slice(&(0x8000u16 | 0x7C00).to_le_bytes()); // bleu 31
+    }
+    // A + B, EVA = 12, EVB = 4, lecture dans D (DISPCNT bits 18–19).
+    nds.bus9().write32(0x0400_0000, 0x0001_0000 | 3 << 18);
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL | 2 << 29 | 12 | 4 << 8);
+    nds.run_frame();
+    // Rouge 31 × 12 / 16 = 23 ; bleu 31 × 4 / 16 = 7.
+    assert_eq!(bank_d(&nds, 0), 0x8000 | 7 << 10 | 23);
+    // Source B sans alpha : seule A compte.
+    let mut nds = capture_nds(0x001F);
+    nds.bus9().write32(0x0400_0000, 0x0001_0000 | 3 << 18);
+    nds.hw.vram.banks[3][..2].copy_from_slice(&0x7C00u16.to_le_bytes());
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL | 2 << 29 | 12 | 4 << 8);
+    nds.run_frame();
+    assert_eq!(bank_d(&nds, 0), 0x8000 | 23);
+    // Source B seule.
+    let mut nds = capture_nds(0x001F);
+    nds.bus9().write32(0x0400_0000, 0x0001_0000 | 3 << 18);
+    nds.hw.vram.banks[3][2..4].copy_from_slice(&0x83E0u16.to_le_bytes());
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL | 1 << 29);
+    nds.run_frame();
+    assert_eq!(bank_d(&nds, 2), 0x83E0);
+}
+
+#[test]
+fn capture_size_offset_and_3d_source() {
+    use crate::nds::gpu3d::render::Pixel;
+    // 128×128 au décalage 08000h : lignes de 128 pixels.
+    let mut nds = capture_nds(0x001F);
+    nds.bus9().write32(0x0400_0064, CAP_ON | 3 << 16 | 1 << 18);
+    nds.run_frame();
+    assert_eq!(bank_d(&nds, 0x8000 + (127 * 128 + 127) * 2), 0x801F);
+    assert_eq!(bank_d(&nds, 0x8000 + 128 * 128 * 2), 0, "rien après 128 lignes");
+    // Banque A (bits 16–17 = 0) : D reste intacte.
+    let mut nds = capture_nds(0x001F);
+    nds.bus9().write8(0x0400_0240, 0x80); // VRAMCNT_A : LCDC
+    nds.bus9().write32(0x0400_0064, CAP_ON | 3 << 20);
+    nds.run_frame();
+    assert_eq!(u16::from_le_bytes([nds.hw.vram.banks[0][0], nds.hw.vram.banks[0][1]]), 0x801F);
+    assert_eq!(bank_d(&nds, 0), 0);
+    // Source A = écran 3D : couleur 6 bits ramenée à 5, alpha 0 respecté.
+    let mut nds = capture_nds(0);
+    nds.hw.gpu3d.renderer.color.fill(Pixel { rgb: [0, 0, 0], alpha: 0 });
+    nds.hw.gpu3d.renderer.color[3] = Pixel { rgb: [62, 0, 2], alpha: 31 };
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL | 1 << 24);
+    nds.run_until(nds.now + 192 * LINE_CYCLES);
+    assert_eq!(bank_d(&nds, 6), 0x8000 | 1 << 10 | 31);
+    assert_eq!(bank_d(&nds, 0), 0, "pixel 3D transparent : alpha 0");
+}
+
+#[test]
+fn captured_bank_is_shown_in_vram_display_mode() {
+    // Le schéma de l'écran titre de Pokémon N2 : capture de l'écran
+    // graphique dans D, affichage de D (mode 2).
+    let mut nds = capture_nds(0x001F);
+    nds.bus9().write32(0x0400_0000, 0x0002_0000 | 3 << 18); // mode VRAM, banque D
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL);
+    nds.run_frame(); // capture
+    nds.bus9().write32(0x0400_0064, CAP_ON | CAP_D_FULL);
+    nds.run_frame(); // affiche l'image capturée (et capture de nouveau)
+    assert_eq!(pixel(&nds, 0, 100, 100), rgb(0x001F), "l'écran graphique, via la banque D");
+}
+
+#[test]
+fn gpu3d_textured_triangle_end_to_end() {
+    use crate::nds::gpu3d::render::WIDTH as W3;
+    let mut nds = Nds::new();
+    // Texture 8×8 en 16 couleurs, unie d'index 1, dans la banque A (via le
+    // mode LCDC), puis A → slot de texture 0 ; palette dans la banque E.
+    let mut bus = nds.bus9();
+    bus.write8(0x0400_0240, 0x80); // A : LCDC
+    for o in (0..32).step_by(4) {
+        bus.write32(0x0680_0000 + o, 0x1111_1111);
+    }
+    bus.write8(0x0400_0244, 0x80); // E : LCDC
+    bus.write16(0x0688_0000 + 2, 31 << 5); // palette[1] = vert
+    bus.write8(0x0400_0240, 0x80 | 3); // A : texture, slot 0
+    bus.write8(0x0400_0244, 0x80 | 3); // E : palettes
+    bus.write16(0x0400_0060, 1); // DISP3DCNT : textures
+    bus.write32(0x0400_0350, 0); // plan arrière
+    bus.write32(0x0400_0354, 0x7FFF);
+    nds.run_frame();
+    let mut bus = nds.bus9();
+    bus.write32(0x0400_04A4, 0xC0 | 31 << 16); // POLYGON_ATTR opaque, modulation
+    bus.write32(0x0400_04A8, 3 << 26 | 1 << 16 | 1 << 17); // 16 couleurs, 8×8, répétée
+    bus.write32(0x0400_04AC, 0); // PLTT_BASE 0
+    bus.write32(0x0400_0480, 0x7FFF); // COLOR blanc
+    bus.write32(0x0400_0500, 0); // BEGIN_VTXS
+    for (x, y) in [(-0x1000i32, -0x1000i32), (0, -0x1000), (-0x1000, 0)] {
+        bus.write32(0x0400_0488, 0); // TEXCOORD
+        bus.write32(0x0400_048C, (x as u32 & 0xFFFF) | (y as u32) << 16);
+        bus.write32(0x0400_048C, 0);
+    }
+    bus.write32(0x0400_0540, 0); // SWAP_BUFFERS
+    nds.run_until(nds.now + 4 * LINE_CYCLES);
+    nds.run_frame();
+    let p = nds.hw.gpu3d.renderer.color[180 * W3 + 10];
+    assert_eq!(p.rgb, [0, 63, 0], "texel vert (31 → 63) modulé par du blanc");
+    assert_eq!(p.alpha, 31);
+}
+
+#[test]
+fn gpu3d_layer_blends_with_its_own_alpha() {
+    use crate::nds::gpu3d::render::{Pixel, WIDTH as W3};
+    // Le réglage de l'introduction de Pokémon N2 : BLDCNT = 0941 (alpha,
+    // BG0 en 1re cible, BG0 et BG3 en 2e), BLDALPHA = 0. Le calque 3D se
+    // mélange avec son propre alpha, pas avec EVA = EVB = 0.
+    let mut nds = Nds::new();
+    nds.bus9().write16(0x0400_0304, 0x820F);
+    nds.bus9().write32(0x0400_0000, 0x0001_0109); // BG0 = 3D
+    nds.bus9().write16(0x0500_0000, 0x7C00); // fond bleu 31
+    nds.bus9().write16(0x0400_0050, 0x2141); // BLDCNT : BG0 → (BG0, fond)
+    nds.bus9().write16(0x0400_0052, 0); // BLDALPHA : EVA = EVB = 0
+    nds.run_frame();
+    nds.hw.gpu3d.renderer.color.fill(Pixel { rgb: [0; 3], alpha: 0 });
+    nds.hw.gpu3d.renderer.color[10 * W3 + 20] = Pixel { rgb: [62, 0, 0], alpha: 31 };
+    nds.hw.gpu3d.renderer.color[10 * W3 + 21] = Pixel { rgb: [62, 0, 0], alpha: 16 };
+    nds.run_until(nds.now + 192 * LINE_CYCLES);
+    let top = nds.hw.gpu.screen(0);
+    // Opaque : EVA = 15, EVB = 1 → rouge 31 × 15 / 16 = 29, bleu 31 / 16 = 1.
+    assert_eq!(top[10 * 256 + 20], rgb(29 | 1 << 10));
+    // Alpha 16 : EVA = 8, EVB = 8 → rouge 15, bleu 15.
+    assert_eq!(top[10 * 256 + 21], rgb(15 | 15 << 10));
+    // Sans 2e cible sous le pixel : la couleur 3D telle quelle.
+    nds.bus9().write16(0x0400_0050, 0x0141);
+    nds.run_frame();
+    nds.hw.gpu3d.renderer.color[10 * W3 + 20] = Pixel { rgb: [62, 0, 0], alpha: 31 };
+    nds.run_until(nds.now + 192 * LINE_CYCLES);
+    assert_eq!(nds.hw.gpu.screen(0)[10 * 256 + 20], rgb(31));
+}
+
+#[test]
+fn gpu3d_skips_identical_renders() {
+    use crate::nds::gpu3d::render::WIDTH as W3;
+    let mut nds = Nds::new();
+    nds.run_frame();
+    let tri = |nds: &mut Nds| {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_04A4, 0xC0 | 31 << 16);
+        bus.write32(0x0400_0480, 31);
+        bus.write32(0x0400_0500, 0);
+        for (x, y) in [(-0x1000i32, -0x1000i32), (0, -0x1000), (-0x1000, 0)] {
+            bus.write32(0x0400_048C, (x as u32 & 0xFFFF) | (y as u32) << 16);
+            bus.write32(0x0400_048C, 0);
+        }
+        bus.write32(0x0400_0540, 0);
+    };
+    nds.bus9().write32(0x0400_0354, 0x7FFF);
+    tri(&mut nds);
+    nds.run_frame(); // échange + rendu
+    let skipped = nds.hw.gpu3d.renders_skipped;
+    nds.run_frame(); // rien de neuf : rendu évité, image conservée
+    assert_eq!(nds.hw.gpu3d.renders_skipped, skipped + 1);
+    assert_eq!(nds.hw.gpu3d.renderer.color[180 * W3 + 10].rgb, [63, 0, 0]);
+    // Un registre de rendu change : on redessine.
+    nds.bus9().write32(0x0400_0350, 31 << 10 | 31 << 16); // plan arrière bleu opaque
+    nds.run_frame();
+    assert_eq!(nds.hw.gpu3d.renders_skipped, skipped + 1);
+    assert_eq!(nds.hw.gpu3d.renderer.color[20 * W3 + 200].rgb, [0, 0, 63]);
+    // La VRAM des textures change : on redessine aussi.
+    nds.bus9().write8(0x0400_0240, 0x80);
+    nds.bus9().write16(0x0680_0000, 1); // (les écritures 8 bits en VRAM sont ignorées)
+    nds.bus9().write8(0x0400_0240, 0x83);
+    nds.run_frame();
+    assert_eq!(nds.hw.gpu3d.renders_skipped, skipped + 1);
+}
+
+#[test]
+fn sound_produces_32728_stereo_samples_per_second() {
+    let mut nds = Nds::new();
+    for _ in 0..60 {
+        nds.run_frame();
+    }
+    let n = nds.hw.sound.out.len() / 2;
+    // Un échantillon toutes les 1024 périodes du bus (2048 cycles ARM9).
+    let expected = nds.now() as f64 / 2048.0;
+    assert!(expected > 32_000.0, "≈ une seconde émulée");
+    assert!((n as f64 - expected).abs() <= 2.0, "{n} au lieu de ≈{expected:.0}");
+    assert!(nds.hw.sound.out.iter().all(|&s| s == 0), "silence sans programme");
+}
+
+#[test]
+fn swi_sound_bias_sets_the_level_and_keeps_the_rest() {
+    let mut nds = Nds::new();
+    let call = |nds: &mut Nds, level: u32| {
+        let mut r = [level, 0x80, 0, 0];
+        hle_swi::swi(&mut nds.bus7(), CpuId::Arm7, 0x08, &mut r)
+    };
+    assert_eq!(call(&mut nds, 1), hle_swi::Swi::Handled);
+    assert_eq!(nds.bus7().read16(0x0400_0504), 0x200, "r0 ≠ 0 : 200h");
+    call(&mut nds, 0);
+    assert_eq!(nds.bus7().read16(0x0400_0504), 0, "r0 = 0 : 000h");
+    call(&mut nds, 0x1234);
+    assert_eq!(nds.hw.sound.bias, 0x200);
+}
+
+#[test]
+fn direct_boot_leaves_the_sound_bias_at_its_usual_level() {
+    let mut nds = Nds::new();
+    nds.direct_boot(include_bytes!("../../tests/roms/boot_test.nds").to_vec()).unwrap();
+    assert_eq!(nds.bus7().read16(0x0400_0504), 0x200);
+}
+
+// --- Palettes étendues (GBATEK « DS Video Extended Palettes ») ---
+
+const YELLOW: u16 = 0x03FF;
+const CYAN: u16 = 0x7FE0;
+
+/// Écrit `color` à l'entrée `index` (palette × 256 + couleur) du slot `slot`
+/// d'une banque, en la passant d'abord en LCDC, puis la place avec `cnt`.
+/// `lcdc` : adresse LCDC de la banque.
+fn ext_palette_bank(nds: &mut Nds, bank: u32, lcdc: u32, slot: u32, index: u32, color: u16, cnt: u8) {
+    // VRAMCNT_A–G en 4000240h–4000246h, H et I en 4000248h–4000249h
+    // (4000247h est WRAMCNT).
+    let reg = if bank < 7 { 0x0400_0240 + bank } else { 0x0400_0241 + bank };
+    let mut bus = nds.bus9();
+    bus.write8(reg, 0x80);
+    bus.write16(lcdc + slot * 0x2000 + index * 2, color);
+    bus.write8(reg, cnt);
+}
+
+/// Moteur A, BG0 en texte 256 couleurs : tuile 1 = index 5 partout, carte
+/// (0,0) = tuile 1 avec le numéro de palette `pnum`. Palette standard :
+/// index 5 = rouge. `bgcnt_extra` est ajouté à BG0CNT.
+fn ext_text_setup(nds: &mut Nds, pnum: u16, bgcnt_extra: u16, dispcnt_extra: u32) {
+    let mut bus = nds.bus9();
+    bus.write8(0x0400_0240, 0x81); // A → fonds du moteur A
+    bus.write32(0x0400_0000, 0x0001_0100 | dispcnt_extra); // mode 0, BG0
+    bus.write16(0x0400_0008, 0x80 | 2 << 8 | bgcnt_extra); // 256 couleurs, carte en 0x1000
+    for i in 0..16 {
+        bus.write32(0x0600_0040 + 4 * i, 0x0505_0505); // tuile 1 (64 octets)
+    }
+    bus.write16(0x0600_1000, 1 | pnum << 12);
+    bus.write16(0x0500_0000, BLUE);
+    bus.write16(0x0500_000A, RED);
+}
+
+#[test]
+fn bg_ext_palette_picks_the_palette_from_the_map_entry() {
+    let mut nds = gpu_nds();
+    // E en palette étendue de fonds A (MST 4) : slot 0, palette 11, index 5.
+    ext_palette_bank(&mut nds, 4, 0x0688_0000, 0, 11 * 256 + 5, GREEN, 0x84);
+    ext_text_setup(&mut nds, 11, 0, 1 << 30);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(GREEN), "palette 11 du slot 0");
+    assert_eq!(pixel(&nds, 0, 8, 0), rgb(BLUE), "tuile 0 : index 0 transparent");
+    // Bit 30 à 0 : palette standard, numéro de palette ignoré.
+    nds.bus9().write32(0x0400_0000, 0x0001_0100);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(RED));
+    assert!(!nds.hw.gpu.unsupported.contains("palettes étendues de fonds"));
+}
+
+#[test]
+fn bg_ext_palette_slots_per_background_and_bank() {
+    // E couvre les slots 0–3 avec ses 32 Ko du bas : BG1 lit le slot 1.
+    let mut nds = gpu_nds();
+    ext_palette_bank(&mut nds, 4, 0x0688_0000, 1, 5, GREEN, 0x84);
+    ext_palette_bank(&mut nds, 4, 0x0688_0000, 0, 5, YELLOW, 0x84);
+    {
+        ext_text_setup(&mut nds, 0, 0, 1 << 30);
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_0000, 0x4001_0200); // BG1 seul
+        bus.write16(0x0400_000A, 0x80 | 2 << 8); // BG1CNT = celui de BG0
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(GREEN), "BG1 → slot 1");
+    // BG0 avec BGxCNT bit 13 → slot 2, fourni par F en OFS = 1 (slots 2–3).
+    let mut nds = gpu_nds();
+    ext_palette_bank(&mut nds, 5, 0x0689_0000, 0, 5, CYAN, 0x8C);
+    ext_text_setup(&mut nds, 0, 1 << 13, 1 << 30);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(CYAN), "BG0 → slot 2 = premier slot de F (OFS 1)");
+    // Même chose avec G en OFS = 0 : il couvre les slots 0–1, pas le 2.
+    let mut nds = gpu_nds();
+    ext_palette_bank(&mut nds, 6, 0x0689_4000, 0, 5, CYAN, 0x84);
+    ext_text_setup(&mut nds, 0, 1 << 13, 1 << 30);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), 0, "slot 2 vide : couleur 0 (noir)");
+    nds.bus9().write16(0x0400_0008, 0x80 | 2 << 8); // bit 13 à 0 → slot 0
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(CYAN), "G (OFS 0) → slot 0");
+}
+
+#[test]
+fn bg_ext_palette_of_engine_b_lives_in_bank_h() {
+    let mut nds = gpu_nds();
+    // H en palette étendue de fonds B (MST 2) : slot 0, palette 2.
+    ext_palette_bank(&mut nds, 7, 0x0689_8000, 0, 2 * 256 + 1, GREEN, 0x82);
+    text_setup(&mut nds); // moteur B, BG0, tuile 1 = index 1, 2…
+    {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_1000, 0x4001_0100);
+        bus.write16(0x0400_1008, 0x80 | 2 << 8); // 256 couleurs
+        bus.write16(0x0620_0040, 0x0101); // tuile 1, 256 couleurs : index 1
+        bus.write16(0x0620_1000, 0x2001); // palette 2
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 0, 0), rgb(GREEN));
+    // E n'est pas au moteur B : ses données ne s'y voient pas.
+    let mut nds2 = gpu_nds();
+    ext_palette_bank(&mut nds2, 4, 0x0688_0000, 0, 2 * 256 + 1, GREEN, 0x84);
+    text_setup(&mut nds2);
+    {
+        let mut bus = nds2.bus9();
+        bus.write32(0x0400_1000, 0x4001_0100);
+        bus.write16(0x0400_1008, 0x80 | 2 << 8);
+        bus.write16(0x0620_0040, 0x0101);
+        bus.write16(0x0620_1000, 0x2001);
+    }
+    nds2.run_frame();
+    assert_eq!(pixel(&nds2, 1, 0, 0), 0);
+    // Et H ne sert pas au moteur A.
+    let mut nds3 = gpu_nds();
+    ext_palette_bank(&mut nds3, 7, 0x0689_8000, 0, 5, GREEN, 0x82);
+    ext_text_setup(&mut nds3, 0, 0, 1 << 30);
+    nds3.run_frame();
+    assert_eq!(pixel(&nds3, 0, 0, 0), 0, "H : moteur B seulement");
+}
+
+#[test]
+fn bg_ext_palette_only_for_16_bit_map_entries() {
+    // Mode 5 : BG2 en rot/scal étendu à entrées 16 bits (BGxCNT bit 7 = 0),
+    // BG3 en bitmap 256 couleurs. Seul BG2 prend la palette étendue.
+    let mut nds = gpu_nds();
+    ext_palette_bank(&mut nds, 4, 0x0688_0000, 2, 4 * 256 + 5, GREEN, 0x84);
+    ext_palette_bank(&mut nds, 4, 0x0688_0000, 3, 5, YELLOW, 0x84);
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0240, 0x81);
+        bus.write32(0x0400_0000, 0x4001_0405); // mode 5, BG2, palettes étendues
+        bus.write16(0x0400_000C, 1 << 2 | 2 << 8); // BG2 : tuiles en 0x4000, carte en 0x1000
+        bus.write32(0x0400_0020, 0x0000_0100); // PA = 1
+        bus.write32(0x0400_0024, 0x0100_0000); // PD = 1
+        for i in 0..16 {
+            bus.write32(0x0600_4040 + 4 * i, 0x0505_0505); // tuile 1
+        }
+        bus.write16(0x0600_1000, 0x4001); // tuile 1, palette 4
+        bus.write16(0x0500_000A, RED);
+        bus.write16(0x0500_0000, BLUE);
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(GREEN), "rot/scal à entrées 16 bits : étendue");
+    // BG3 en bitmap 256 couleurs : palette standard.
+    {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_0000, 0x4001_0805);
+        bus.write16(0x0400_000E, 0x0080 | 4 << 8); // bitmap 256 couleurs en 0x10000
+        bus.write32(0x0400_0030, 0x0000_0100);
+        bus.write32(0x0400_0034, 0x0100_0000);
+        bus.write16(0x0601_0000, 0x0005);
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(RED), "bitmap : standard");
+    // Mode 2 : BG2 en rot/scal classique (entrées 8 bits) : standard.
+    {
+        let mut bus = nds.bus9();
+        bus.write32(0x0400_0000, 0x4001_0402);
+        bus.write16(0x0400_000C, 1 << 2 | 2 << 8);
+        bus.write16(0x0600_1000, 0x0001); // carte 8 bits : tuile 1
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 0, 0), rgb(RED), "rot/scal 8 bits : standard");
+}
+
+#[test]
+fn bg_ext_palette_leaves_16_color_tiles_alone() {
+    let mut nds_a = gpu_nds();
+    ext_palette_bank(&mut nds_a, 4, 0x0688_0000, 0, 1, GREEN, 0x84);
+    {
+        let mut bus = nds_a.bus9();
+        bus.write8(0x0400_0240, 0x81);
+        bus.write32(0x0400_0000, 0x4001_0100);
+        bus.write16(0x0400_0008, 2 << 8); // 16 couleurs
+        bus.write16(0x0600_0020, 0x0001); // tuile 1 : index 1
+        bus.write16(0x0600_1000, 0x0001);
+        bus.write16(0x0500_0002, RED);
+    }
+    nds_a.run_frame();
+    assert_eq!(pixel(&nds_a, 0, 0, 0), rgb(RED), "16 couleurs : standard");
+}
+
+#[test]
+fn obj_ext_palette_for_256_color_sprites() {
+    // F en palette étendue de sprites A (MST 5) : palette 6, index 1.
+    let mut nds = obj_nds(0x1010 | 1 << 31);
+    ext_palette_bank(&mut nds, 5, 0x0689_0000, 0, 6 * 256 + 1, GREEN, 0x85);
+    {
+        let mut bus = nds.bus9();
+        bus.write16(0x0640_0000, 0x0101); // tuile 0, 256 couleurs : index 1, 1
+        bus.write16(0x0500_0202, RED);
+    }
+    sprite(&mut nds, 0, 20 | 0x2000, 10, 6 << 12); // 256 couleurs, palette 6
+    // Sprite 16 couleurs, tuile 2, palette 0 : standard.
+    nds.bus9().write16(0x0640_0040, 0x0001); // tuile 2 : index 1
+    sprite(&mut nds, 1, 40, 10, 2);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(GREEN), "sprite 256 couleurs : palette étendue 6");
+    assert_eq!(pixel(&nds, 0, 10, 40), rgb(RED), "sprite 16 couleurs : standard");
+    // Bit 31 à 0 : palette standard.
+    nds.bus9().write32(0x0400_0000, 0x0001_1010);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), rgb(RED));
+    // Seuls les 8 Ko du bas de F servent : le « slot 1 » de F est ignoré.
+    let mut nds = obj_nds(0x1010 | 1 << 31);
+    ext_palette_bank(&mut nds, 5, 0x0689_0000, 1, 6 * 256 + 1, GREEN, 0x85);
+    nds.bus9().write16(0x0640_0000, 0x0101);
+    sprite(&mut nds, 0, 20 | 0x2000, 10, 6 << 12);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), 0);
+}
+
+#[test]
+fn obj_ext_palette_of_engine_b_lives_in_bank_i() {
+    let mut nds = gpu_nds();
+    // I en palette étendue de sprites B (MST 3) ; D en sprites du moteur B.
+    ext_palette_bank(&mut nds, 8, 0x068A_0000, 0, 256 + 1, GREEN, 0x83);
+    {
+        let mut bus = nds.bus9();
+        bus.write8(0x0400_0243, 0x84); // D → sprites du moteur B
+        bus.write32(0x0400_1000, 0x8001_1010); // sprites, 1D, palettes étendues
+        for i in 0..128 {
+            bus.write16(0x0700_0400 + 8 * i, 0x0200);
+        }
+        bus.write16(0x0660_0000, 0x0101);
+        bus.write16(0x0700_0400, 20 | 0x2000);
+        bus.write16(0x0700_0402, 10);
+        bus.write16(0x0700_0404, 1 << 12);
+    }
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 1, 10, 20), rgb(GREEN));
+    // I ne sert pas au moteur A.
+    let mut nds = obj_nds(0x1010 | 1 << 31);
+    ext_palette_bank(&mut nds, 8, 0x068A_0000, 0, 256 + 1, GREEN, 0x83);
+    nds.bus9().write16(0x0640_0000, 0x0101);
+    sprite(&mut nds, 0, 20 | 0x2000, 10, 1 << 12);
+    nds.run_frame();
+    assert_eq!(pixel(&nds, 0, 10, 20), 0, "I : moteur B seulement");
 }

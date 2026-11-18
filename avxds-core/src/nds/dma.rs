@@ -10,6 +10,11 @@ pub enum Trigger {
     Immediate,
     VBlank,
     HBlank,
+    /// Mot prêt sur le bus de la cartouche (ARM9 : 5, ARM7 : 2).
+    Cartridge,
+    /// FIFO de géométrie à moins de moitié pleine (ARM9 : 7). Rafales d'au
+    /// plus 112 mots (GBATEK « DS 3D Geometry Commands »).
+    GeometryFifo,
     /// Tout autre déclencheur (cartouche, FIFO géométrique…), pas encore géré.
     Other(u8),
 }
@@ -23,6 +28,8 @@ pub struct Channel {
     /// Adresses internes, latchées à l'activation.
     pub src: u32,
     pub dst: u32,
+    /// Unités restant à transférer (mode FIFO géométrie, par rafales).
+    pub left: u32,
 }
 
 impl Channel {
@@ -66,12 +73,15 @@ impl Dma {
                 0 => Trigger::Immediate,
                 1 => Trigger::VBlank,
                 2 => Trigger::HBlank,
+                5 => Trigger::Cartridge,
+                7 => Trigger::GeometryFifo,
                 t => Trigger::Other(t as u8),
             }
         } else {
             match (cnt >> 28) & 3 {
                 0 => Trigger::Immediate,
                 1 => Trigger::VBlank,
+                2 => Trigger::Cartridge,
                 t => Trigger::Other(t as u8 + 8), // 8+ : déclencheurs ARM7
             }
         }
@@ -119,6 +129,7 @@ impl Dma {
                         if c.enabled() && !was {
                             c.src = c.sad & 0x0FFF_FFFF;
                             c.dst = c.dad & 0x0FFF_FFFF;
+                            self.ch[n].left = self.count(n);
                             if self.trigger_of(n) == Trigger::Immediate {
                                 return Some(Some(n));
                             }

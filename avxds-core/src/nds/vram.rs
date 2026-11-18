@@ -236,4 +236,72 @@ impl Vram {
         self.write16(region, off, val as u16);
         self.write16(region, off + 2, (val >> 16) as u16);
     }
+
+    /// Palettes étendues de fonds d'un moteur : 4 slots de 8 Ko (GBATEK
+    /// « DS Video Extended Palettes »). Moteur A : E (slots 0–3, 32 Ko
+    /// du bas), F ou G (slots 0–1 si OFS = 0, 2–3 si OFS = 1) ; moteur B :
+    /// H (slots 0–3) (GBATEK « DS Memory Control - VRAM »).
+    pub fn bg_ext_palette(&self, engine_a: bool) -> ExtPalette<'_> {
+        let mut pal = ExtPalette::default();
+        for (b, mapping) in self.mapping.iter().enumerate() {
+            let first = match (*mapping, engine_a, b) {
+                (Mapping::Gpu(GpuRole::BgExtPaletteA(_)), true, 4) => 0,
+                (Mapping::Gpu(GpuRole::BgExtPaletteA(ofs)), true, _) => 2 * ofs as usize,
+                (Mapping::Gpu(GpuRole::BgExtPaletteB), false, _) => 0,
+                _ => continue,
+            };
+            pal.add(&self.banks[b], first);
+        }
+        pal
+    }
+
+    /// Palette étendue des sprites d'un moteur : un seul slot, les 8 Ko du
+    /// bas de F ou G (moteur A) ou de I (moteur B).
+    pub fn obj_ext_palette(&self, engine_a: bool) -> ExtPalette<'_> {
+        let mut pal = ExtPalette::default();
+        for (b, mapping) in self.mapping.iter().enumerate() {
+            match (*mapping, engine_a) {
+                (Mapping::Gpu(GpuRole::ObjExtPaletteA), true) | (Mapping::Gpu(GpuRole::ObjExtPaletteB), false) => {
+                    pal.add(&self.banks[b][..SLOT], 0);
+                }
+                _ => {}
+            }
+        }
+        pal
+    }
+}
+
+/// Taille d'un slot de palette étendue : 16 palettes de 256 couleurs.
+const SLOT: usize = 8 << 10;
+
+/// Vue en lecture des palettes étendues d'un moteur. Pour chaque slot, les
+/// banques qui le couvrent (au plus E, F et G) ; si plusieurs se
+/// chevauchent, leurs contenus sont combinés par OU, comme pour la VRAM vue
+/// du CPU.
+#[derive(Default)]
+pub struct ExtPalette<'a> {
+    slots: [[Option<&'a [u8]>; 3]; 4],
+}
+
+impl<'a> ExtPalette<'a> {
+    /// Place les slots couverts par `bank`, à partir de `first`.
+    fn add(&mut self, bank: &'a [u8], first: usize) {
+        for (k, chunk) in bank.chunks_exact(SLOT).enumerate() {
+            let Some(slot) = self.slots.get_mut(first + k) else { break };
+            if let Some(free) = slot.iter_mut().find(|s| s.is_none()) {
+                *free = Some(chunk);
+            }
+        }
+    }
+
+    /// Couleur `index` (0..4095 : palette × 256 + couleur) du slot `slot`,
+    /// en 15 bits ; 0 si aucune banque n'y est placée.
+    pub fn color(&self, slot: usize, index: usize) -> u16 {
+        let o = (index & 0xFFF) * 2;
+        self.slots[slot & 3]
+            .iter()
+            .flatten()
+            .fold(0, |c, s| c | u16::from_le_bytes([s[o], s[o + 1]]))
+            & 0x7FFF
+    }
 }

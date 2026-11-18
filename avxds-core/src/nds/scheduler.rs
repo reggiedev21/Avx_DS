@@ -20,9 +20,11 @@ pub enum Event {
     LineEnd,
     /// Débordement d'un timer.
     Timer(CpuId, u8),
+    /// Échantillon de sortie du contrôleur son.
+    Sound,
 }
 
-const N: usize = 10;
+const N: usize = 11;
 
 impl Event {
     fn index(self) -> usize {
@@ -31,6 +33,7 @@ impl Event {
             Event::LineEnd => 1,
             Event::Timer(CpuId::Arm9, n) => 2 + n as usize,
             Event::Timer(CpuId::Arm7, n) => 6 + n as usize,
+            Event::Sound => 10,
         }
     }
 
@@ -39,6 +42,7 @@ impl Event {
             0 => Event::HBlank,
             1 => Event::LineEnd,
             2..=5 => Event::Timer(CpuId::Arm9, (i - 2) as u8),
+            10 => Event::Sound,
             _ => Event::Timer(CpuId::Arm7, (i - 6) as u8),
         }
     }

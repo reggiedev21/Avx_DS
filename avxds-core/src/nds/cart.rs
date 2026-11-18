@@ -129,3 +129,22 @@ impl Header {
         self.game_code.iter().map(|&c| c as char).collect()
     }
 }
+
+/// Identifiant de puce renvoyé par les commandes 90h et B8h, déduit de la
+/// taille de la ROM (la plus grande de l'en-tête et du fichier, arrondie à
+/// une puissance de 2). Source : GBATEK « DS Cartridge Protocol ».
+///
+/// - octet 1 : fabricant, C2h (Macronix) ;
+/// - octet 2 : taille, 00h–7Fh = (N+1) Mo, F0h–FFh = (100h−N) × 256 Mo
+///   (formule marquée « ? » par GBATEK, mais cohérente avec ses exemples
+///   FFh = 256 Mo et FEh = 512 Mo) ;
+/// - bit 31 : protocole des grandes cartouches, « 64 Mo ou plus ». GBATEK
+///   classe 64 Mo des deux côtés ; on le pose au-delà de 64 Mo.
+pub fn chip_id(header: &Header, rom_len: usize) -> u32 {
+    let from_header = if header.device_capacity < 16 { (128usize << 10) << header.device_capacity } else { 0 };
+    let size = from_header.max(rom_len).max(1 << 20).next_power_of_two();
+    let mb = (size >> 20) as u32;
+    let size_byte = if mb <= 128 { mb - 1 } else { 0x100 - mb / 256 };
+    let protocol = if mb > 64 { 1 << 31 } else { 0 };
+    0xC2 | (size_byte & 0xFF) << 8 | protocol
+}

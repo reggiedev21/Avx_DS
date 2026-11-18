@@ -2,7 +2,8 @@
 //!
 //! * [`cpu`] : les deux processeurs (ARM946E-S et ARM7TDMI), un interpréteur
 //!   unique générique sur la version d'architecture ;
-//! * [`nds`] : la machine (mémoire, CP15, VRAM, IRQ, IPC, division…).
+//! * [`nds`] : la machine (mémoire, CP15, VRAM, IRQ, IPC, division…) ;
+//! * [`audio`] : file d'attente et rééchantillonnage vers la carte son.
 //!
 //! ```
 //! use avxds_core::cpu::{Arm9, Arm7};
@@ -14,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod bus;
 pub mod cpu;
 pub mod nds;

@@ -4,7 +4,7 @@
 //! de sauter dans le jeu. Les valeurs viennent de `NDS::SetupDirectBoot` de
 //! melonDS (consulté le 17 novembre 2026), sauf mention contraire.
 
-use super::cart::{CartError, Header};
+use super::cart::{crc16, CartError, Header};
 use super::hle_bios;
 use super::{Nds, CpuId};
 use crate::bus::{Bus, Cp15Op};
@@ -40,7 +40,30 @@ fn cp15(crn: u8, crm: u8, opc2: u8) -> Cp15Op {
 /// Valeurs par défaut choisies par AvxDS, d'après le format décrit par
 /// GBATEK (« DS Firmware User Settings ») ; à vérifier le jour où un jeu
 /// s'en sert (calibrage de l'écran tactile notamment).
-fn user_settings() -> [u8; 0x70] {
+/// Réglages utilisateur d'une image de firmware : la copie valide (CRC
+/// correct) au compteur le plus élevé ; à défaut, ceux d'AvxDS.
+pub(crate) fn firmware_user_settings(fw: &[u8]) -> [u8; 0x70] {
+    let ptr = fw.get(0x20..0x22).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) as usize * 8);
+    let mut best: Option<(u16, [u8; 0x70])> = None;
+    for copy in 0..2 {
+        let base = ptr + copy * 0x100;
+        let Some(block) = fw.get(base..base + 0x74) else { continue };
+        let data: [u8; 0x70] = block[..0x70].try_into().unwrap();
+        let counter = u16::from_le_bytes([block[0x70], block[0x71]]) & 0x7F;
+        let crc = u16::from_le_bytes([block[0x72], block[0x73]]);
+        if crc != crc16(0xFFFF, data) {
+            continue;
+        }
+        // Compteur sur 7 bits : 0 suit 0x7F.
+        let newer = |b: u16| (counter.wrapping_sub(b) & 0x7F) < 0x40;
+        if best.as_ref().is_none_or(|(c, _)| newer(*c)) {
+            best = Some((counter, data));
+        }
+    }
+    best.map_or_else(user_settings, |(_, d)| d)
+}
+
+pub(crate) fn user_settings() -> [u8; 0x70] {
     let mut s = [0u8; 0x70];
     s[0x00] = 5; // version
     s[0x02] = 11; // couleur préférée
@@ -51,7 +74,9 @@ fn user_settings() -> [u8; 0x70] {
     }
     s[0x1A] = 5; // longueur du pseudo
     // Calibrage tactile : deux points (ADC 12 bits → pixel).
-    let calib: [(u16, u16, u8, u8); 2] = [(0x0200, 0x0200, 0x20, 0x20), (0x0E00, 0x0E00, 0xE0, 0xA0)];
+    // X : 16 unités ADC par pixel, Y : 20, pour que tout l'écran tienne
+    // dans les 12 bits du TSC (0x010–0xFF0 en X, 0x094–0xF6C en Y).
+    let calib: [(u16, u16, u8, u8); 2] = [(0x0200, 0x0300, 0x20, 0x20), (0x0E00, 0x0D00, 0xE0, 0xA0)];
     for (k, (ax, ay, px, py)) in calib.iter().enumerate() {
         let o = 0x58 + 6 * k;
         s[o..o + 2].copy_from_slice(&ax.to_le_bytes());
@@ -68,7 +93,22 @@ impl Nds {
     /// mini-BIOS d'AvxDS et l'émulation des appels BIOS en Rust.
     pub fn direct_boot(&mut self, rom: Vec<u8>) -> Result<Header, BootError> {
         let header = Header::parse(&rom)?;
+        // Ce qui vit hors de la console survit au redémarrage : la flash du
+        // firmware, l'horloge (pile), le stylet et les touches tenus.
+        let firmware = std::mem::take(&mut self.hw.spi.firmware.data);
+        let (rtc_offset, rtc_fixed) = (self.hw.rtc.offset, self.hw.rtc.fixed_time);
+        let (pen, keys, ext) = (self.hw.spi.touch.pen, self.hw.keyinput, self.hw.extkeyin);
+        let save = std::mem::take(&mut self.hw.slot1.save);
         *self = Nds::new();
+        if firmware.len() == super::FIRMWARE_SIZE {
+            self.hw.spi.firmware.data = firmware;
+        }
+        self.hw.rtc.offset = rtc_offset;
+        self.hw.rtc.fixed_time = rtc_fixed;
+        self.hw.spi.touch.pen = pen;
+        self.hw.keyinput = keys;
+        self.hw.extkeyin = ext;
+        self.hw.slot1.save = save; // la puce de sauvegarde est sur la cartouche
 
         self.load_bios9(&hle_bios::bytes(hle_bios::BIOS9));
         self.load_bios7(&hle_bios::bytes(hle_bios::BIOS7));
@@ -97,10 +137,19 @@ impl Nds {
         self.hw.postflg7 = 1;
         self.hw.powcnt1 = 0x820F;
         self.hw.powcnt2 = 1;
+        // Slot 1 et slot 2 à l'ARM9 (EXMEMCNT bit 11 = 0, bit 7 = 0).
+        // Valeur supposée, à confirmer.
+        self.hw.exmemcnt = 0x6000;
+        // Biais du son à son niveau habituel (200h, GBATEK), comme le laisse
+        // le firmware, qui joue son propre son avant de lancer le jeu.
+        // Pokémon N2 ne le règle pas lui-même : sans ça, la moitié
+        // négative de l'onde est coupée (SOUND_SPEC §H8).
+        self.hw.sound.bias = 0x200;
 
         // Identifiant de puce : fabricant 0xC2, taille en Mo - 1 (approché).
-        let megabytes = rom.len().div_ceil(1 << 20).max(1) as u32;
-        let chip_id = 0xC2 | ((megabytes - 1) & 0xFF) << 8;
+        let chip_id = super::cart::chip_id(&header, rom.len());
+        self.hw.slot1.chip_id = chip_id;
+        let settings = firmware_user_settings(&self.hw.spi.firmware.data);
         let header_crc = header.header_crc as u32;
         let secure_crc = header.secure_area_crc as u32;
         {
@@ -117,7 +166,7 @@ impl Nds {
             bus.write16(0x027F_FC10, 0x5835);
             bus.write16(0x027F_FC30, 0xFFFF);
             bus.write16(0x027F_FC40, 0x0001); // démarrage depuis la cartouche
-            for (i, b) in user_settings().into_iter().enumerate() {
+            for (i, b) in settings.into_iter().enumerate() {
                 bus.write8(0x027F_FC80 + i as u32, b);
             }
         }

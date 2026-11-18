@@ -9,7 +9,7 @@
 //! Sprites (normaux, affines, bitmap), fenêtres (WIN0, WIN1, OBJ) et
 //! mélange (alpha, éclaircir, assombrir, sprites semi-transparents).
 //!
-//! Pas encore : mosaïque, palettes étendues, 3D, capture. Leur emploi est noté dans
+//! Pas encore : mosaïque. Son emploi est noté dans
 //! [`Gpu::unsupported`].
 
 use super::vram::{Region, Vram};
@@ -149,8 +149,22 @@ impl Engine {
     }
 }
 
+/// Ligne produite par l'unité de capture, à écrire en VRAM par l'appelant
+/// (le rendu n'a qu'un accès en lecture à la VRAM).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureLine {
+    /// Banque A–D (0–3).
+    pub bank: usize,
+    /// Décalage du premier pixel dans la banque (repli à 128 Ko).
+    pub offset: usize,
+    /// Pixels 15 bits, bit 15 = alpha.
+    pub pixels: Vec<u16>,
+}
+
 pub struct Gpu {
     pub engines: [Engine; 2],
+    /// Capture en cours pour cette image (DISPCAPCNT bit 31 vu à la ligne 0).
+    capturing: bool,
     /// Image de chaque écran, 0x00RRGGBB : indice 0 = écran du haut.
     pub screens: [Box<[u32]>; 2],
     /// Fonctions demandées par les jeux mais pas encore rendues.
@@ -161,6 +175,7 @@ impl Default for Gpu {
     fn default() -> Self {
         Gpu {
             engines: [Engine::new(true), Engine::new(false)],
+            capturing: false,
             screens: [vec![0; WIDTH * HEIGHT].into_boxed_slice(), vec![0; WIDTH * HEIGHT].into_boxed_slice()],
             unsupported: BTreeSet::new(),
         }
@@ -173,6 +188,8 @@ pub struct RenderCtx<'a> {
     pub palette: &'a [u8],
     pub oam: &'a [u8],
     pub powcnt1: u16,
+    /// Image du moteur 3D (256×192), lue comme BG0 du moteur A.
+    pub layer3d: &'a [super::gpu3d::render::Pixel],
 }
 
 impl Gpu {
@@ -199,14 +216,24 @@ impl Gpu {
         }
     }
 
+    /// Ligne 192 : début du VBlank. DISPCAPCNT bit 31 retombe, quelle que
+    /// soit la taille de la capture (GBATEK).
     pub fn start_frame(&mut self) {
         for e in &mut self.engines {
             e.reload_affine();
         }
+        self.engines[0].regs[0x64 / 4] &= !(1 << 31);
+        self.capturing = false;
     }
 
-    /// Dessine la ligne `y` des deux écrans.
-    pub fn render_line(&mut self, y: usize, ctx: &RenderCtx) {
+    /// Dessine la ligne `y` des deux écrans ; renvoie la ligne capturée
+    /// s'il y a une capture en cours.
+    pub fn render_line(&mut self, y: usize, ctx: &RenderCtx) -> Option<CaptureLine> {
+        if y == 0 {
+            // La capture commence à la ligne 0 qui suit l'écriture du bit 31.
+            self.capturing = self.engines[0].regs[0x64 / 4] & (1 << 31) != 0;
+        }
+        let mut captured = None;
         let mut line = [0u16; WIDTH];
         for e in 0..2 {
             let screen = if (ctx.powcnt1 & 0x8000 != 0) == (e == 0) { 0 } else { 1 };
@@ -214,6 +241,9 @@ impl Gpu {
                 line = [0; WIDTH]; // écrans éteints : noir
             } else {
                 self.render_engine_line(e, y, ctx, &mut line);
+            }
+            if e == 0 && self.capturing {
+                captured = self.capture_line(y, ctx, &line);
             }
             let out = &mut self.screens[screen][y * WIDTH..(y + 1) * WIDTH];
             let mb = self.engines[e].master_bright();
@@ -227,6 +257,86 @@ impl Gpu {
                 a.iy = a.iy.wrapping_add(a.pd as i32);
             }
         }
+        captured
+    }
+
+    /// Unité de capture du moteur A (GBATEK « DS Video Capture and Main
+    /// Memory Display Mode »). `shown` : la ligne affichée par le moteur A.
+    fn capture_line(&mut self, y: usize, ctx: &RenderCtx, shown: &[u16; WIDTH]) -> Option<CaptureLine> {
+        let cap = self.engines[0].regs[0x64 / 4];
+        let (w, h) = match (cap >> 20) & 3 {
+            0 => (128, 128),
+            1 => (256, 64),
+            2 => (256, 128),
+            _ => (256, 192),
+        };
+        if y >= h {
+            return None;
+        }
+        let dispcnt = self.engines[0].dispcnt();
+        let display_mode = (dispcnt >> 16) & 3;
+        // Source A : écran graphique (BG + 3D + OBJ) ou écran 3D. Hypothèse :
+        // l'écran graphique a toujours l'alpha à 1.
+        let src_a: Vec<(u16, bool)> = if cap & (1 << 24) == 0 {
+            let gfx = if display_mode == 1 {
+                *shown
+            } else {
+                let mut g = [0u16; WIDTH];
+                self.render_graphics(0, y, ctx, &mut g);
+                g
+            };
+            gfx.iter().map(|&c| (c, true)).collect()
+        } else {
+            ctx.layer3d[y * WIDTH..(y + 1) * WIDTH]
+                .iter()
+                .map(|p| {
+                    let [r, g, b] = p.rgb.map(|c| (c >> 1) as u16);
+                    (r | g << 5 | b << 10, p.alpha != 0)
+                })
+                .collect()
+        };
+        // Source B : banque VRAM choisie par DISPCNT bits 18–19 ; décalage de
+        // lecture ignoré en mode d'affichage VRAM. La FIFO de la mémoire
+        // principale n'est pas émulée.
+        if cap & (1 << 25) != 0 {
+            self.unsupported.insert("capture depuis la FIFO de la Main RAM");
+        }
+        let bank = &ctx.vram.banks[((dispcnt >> 18) & 3) as usize];
+        let read_base = if display_mode == 2 { 0 } else { ((cap >> 26) & 3) as usize * 0x8000 };
+        let src_b = |x: usize| -> (u16, bool) {
+            if cap & (1 << 25) != 0 {
+                return (0, false);
+            }
+            let o = (read_base + (y * w + x) * 2) & 0x1_FFFF;
+            let v = u16::from_le_bytes([bank[o], bank[o + 1]]);
+            (v & 0x7FFF, v & 0x8000 != 0)
+        };
+        let eva = (cap & 0x1F).min(16) as u16;
+        let evb = ((cap >> 8) & 0x1F).min(16) as u16;
+        let pixels = (0..w)
+            .map(|x| {
+                let (a, aa) = src_a[x];
+                let (b, ab) = src_b(x);
+                let (c, alpha) = match (cap >> 29) & 3 {
+                    0 => (a, aa),
+                    1 => (b, ab),
+                    _ => {
+                        let ch = |s: u32| -> u16 {
+                            let ca = ((a >> s) & 31) * aa as u16 * eva;
+                            let cb = ((b >> s) & 31) * ab as u16 * evb;
+                            ((ca + cb) / 16).min(31) << s
+                        };
+                        (ch(0) | ch(5) | ch(10), (aa && eva > 0) || (ab && evb > 0))
+                    }
+                };
+                c | (alpha as u16) << 15
+            })
+            .collect();
+        Some(CaptureLine {
+            bank: ((cap >> 16) & 3) as usize,
+            offset: ((cap >> 18) & 3) as usize * 0x8000 + y * w * 2,
+            pixels,
+        })
     }
 
     fn render_engine_line(&mut self, e: usize, y: usize, ctx: &RenderCtx, line: &mut [u16; WIDTH]) {
@@ -266,28 +376,62 @@ impl Gpu {
             u16::from_le_bytes([ctx.palette[o], ctx.palette[o + 1]]) & 0x7FFF
         };
         let mut notes: Vec<&'static str> = Vec::new();
-        if dispcnt & (1 << 30) != 0 {
-            notes.push("palettes étendues de fonds");
-        }
+        // Palettes étendues de fonds (DISPCNT bit 30) : seulement pour les
+        // tuiles 256 couleurs à entrées de carte 16 bits, en texte comme en
+        // rot/scal étendu ; les tuiles 16 couleurs, les tuiles rot/scal à
+        // entrées 8 bits, les bitmaps et la couleur de fond gardent la
+        // palette standard (GBATEK « DS Video Extended Palettes »).
+        let ext_bg = (dispcnt & (1 << 30) != 0).then(|| ctx.vram.bg_ext_palette(eng.is_a));
 
         // 1. Chaque fond actif dessine sa ligne.
         let mut bgs = [[None::<u16>; WIDTH]; 4];
         let mut bg_on = [false; 4];
+        // BG0 est-il le calque 3D, et l'alpha 3D (5 bits) de chaque pixel.
+        let mut bg0_is_3d = false;
+        let mut alpha3d = [31u8; WIDTH];
         for bg in 0..4 {
             if dispcnt & (1 << (8 + bg)) == 0 {
                 continue;
             }
             let Some(kind) = eng.bg_kind(bg) else { continue };
             if bg == 0 && eng.is_a && dispcnt & 8 != 0 {
-                notes.push("3D (BG0)");
+                // Calque 3D : défilement horizontal seul, sur 512 pixels dont
+                // 256 transparents (GBATEK « Final 2D Output »). Couleur 6 bits
+                // ramenée à 5 (le reste du moteur 2D travaille en 15 bits).
+                // Alpha 0 = transparent (hypothèse ; mélange par l'alpha 3D :
+                // plus tard).
+                let hofs = eng.regs[0x10 / 4] & 0x1FF;
+                for (x, out) in bgs[0].iter_mut().enumerate() {
+                    let sx = (x as u32 + hofs) & 511;
+                    if sx < WIDTH as u32 {
+                        let p = ctx.layer3d[y * WIDTH + sx as usize];
+                        if p.alpha != 0 {
+                            let [r, g, b] = p.rgb.map(|c| (c >> 1) as u16);
+                            *out = Some(r | g << 5 | b << 10);
+                            alpha3d[x] = p.alpha;
+                        }
+                    }
+                }
+                bg_on[0] = true;
+                bg0_is_3d = true;
                 continue;
             }
             if eng.bgcnt(bg) & 0x40 != 0 {
                 notes.push("mosaïque");
             }
+            // Slot : celui du fond ; BG0 et BG1 peuvent prendre les slots 2
+            // et 3 (BGxCNT bit 13, GBATEK « DS Video BG Modes / Control »).
+            let slot = if bg < 2 && eng.bgcnt(bg) & 0x2000 != 0 { bg + 2 } else { bg };
+            // Couleur d'une tuile 256 couleurs à entrée 16 bits : la palette
+            // étendue a 16 palettes de 256 couleurs, choisies par les bits
+            // 12–15 de l'entrée (inutilisés sinon en 256 couleurs).
+            let pal256 = |entry: u32, idx: usize| match &ext_bg {
+                Some(ext) => ext.color(slot, (entry >> 12) as usize * 256 + idx),
+                None => pal(idx),
+            };
             match kind {
-                BgKind::Text => eng.text_line(bg, y, ctx.vram, region, &pal, &mut bgs[bg]),
-                _ => eng.affine_line(bg, kind, ctx.vram, region, &pal, &mut bgs[bg]),
+                BgKind::Text => eng.text_line(bg, y, ctx.vram, region, &pal, &pal256, &mut bgs[bg]),
+                _ => eng.affine_line(bg, kind, ctx.vram, region, &pal, &pal256, &mut bgs[bg]),
             }
             bg_on[bg] = true;
         }
@@ -366,6 +510,14 @@ impl Gpu {
                 blend_alpha(top.2, below.2, eva, evb)
             } else if mask & 0x20 != 0 && first & top.1 != 0 {
                 match effect {
+                    // Calque 3D en première cible : son alpha par pixel
+                    // remplace BLDALPHA, EVA = A / 2, EVB = 16 − A / 2 (GBATEK
+                    // « Final 2D Output », « probablement » ; Pokémon N2 s'y fie
+                    // avec BLDALPHA = 0).
+                    1 if second & below.1 != 0 && bg0_is_3d && top.1 == 1 => {
+                        let a = alpha3d[x] as u16 / 2;
+                        blend_alpha(top.2, below.2, a, 16 - a)
+                    }
                     1 if second & below.1 != 0 => blend_alpha(top.2, below.2, eva, evb),
                     2 => brightness(top.2, evy, true),
                     3 => brightness(top.2, evy, false),
@@ -455,9 +607,11 @@ impl Engine {
         let dispcnt = self.dispcnt();
         let one_d = dispcnt & (1 << 4) != 0;
         let tile_step = 32u32 << ((dispcnt >> 20) & 3);
-        if dispcnt & (1 << 31) != 0 {
-            notes.push("palettes étendues de sprites");
-        }
+        // Palette étendue (DISPCNT bit 31) : sprites 256 couleurs seulement,
+        // 16 palettes de 256 couleurs (GBATEK « DS Video Extended
+        // Palettes ») ; numéro de palette dans les bits 12–15 de
+        // l'attribut 2, comme pour les sprites 16 couleurs.
+        let ext_obj = (dispcnt & (1 << 31) != 0).then(|| ctx.vram.obj_ext_palette(self.is_a));
 
         for i in 0..128 {
             let a0 = rd16(i * 8) as u32;
@@ -537,7 +691,10 @@ impl Engine {
                         (tile & !1) * 32 + (ty / 8) * 1024 + (tx / 8) * 64
                     } + (ty % 8) * 8 + tx % 8;
                     let idx = ctx.vram.read8(region, off) as usize;
-                    (idx != 0).then(|| pal(idx))
+                    (idx != 0).then(|| match &ext_obj {
+                        Some(ext) => ext.color(0, (a2 >> 12) as usize * 256 + idx),
+                        None => pal(idx),
+                    })
                 } else {
                     let off = if one_d {
                         tile * tile_step + ((ty / 8) * (w / 8) + tx / 8) * 32
@@ -570,7 +727,19 @@ impl Engine {
         (cb, sb)
     }
 
-    fn text_line(&self, bg: usize, y: usize, vram: &Vram, region: Region, pal: &impl Fn(usize) -> u16, out: &mut [Option<u16>; WIDTH]) {
+    /// `pal256(entrée, index)` : couleur des tuiles 256 couleurs à entrée
+    /// de carte 16 bits (palette standard ou étendue).
+    #[allow(clippy::too_many_arguments)]
+    fn text_line(
+        &self,
+        bg: usize,
+        y: usize,
+        vram: &Vram,
+        region: Region,
+        pal: &impl Fn(usize) -> u16,
+        pal256: &impl Fn(u32, usize) -> u16,
+        out: &mut [Option<u16>; WIDTH],
+    ) {
         let cnt = self.bgcnt(bg) as u32;
         let (cb, sb) = self.char_and_screen_base(bg);
         let color256 = cnt & 0x80 != 0;
@@ -595,7 +764,7 @@ impl Engine {
             }
             let color = if color256 {
                 let idx = vram.read8(region, cb + tile * 64 + ty * 8 + tx) as usize;
-                (idx != 0).then(|| pal(idx))
+                (idx != 0).then(|| pal256(entry, idx))
             } else {
                 let b = vram.read8(region, cb + tile * 32 + ty * 4 + tx / 2);
                 let idx = ((b >> ((tx & 1) * 4)) & 0xF) as usize;
@@ -605,7 +774,17 @@ impl Engine {
         }
     }
 
-    fn affine_line(&self, bg: usize, kind: BgKind, vram: &Vram, region: Region, pal: &impl Fn(usize) -> u16, out: &mut [Option<u16>; WIDTH]) {
+    #[allow(clippy::too_many_arguments)]
+    fn affine_line(
+        &self,
+        bg: usize,
+        kind: BgKind,
+        vram: &Vram,
+        region: Region,
+        pal: &impl Fn(usize) -> u16,
+        pal256: &impl Fn(u32, usize) -> u16,
+        out: &mut [Option<u16>; WIDTH],
+    ) {
         let cnt = self.bgcnt(bg) as u32;
         let a = self.affine[bg - 2];
         let (cb, sb) = self.char_and_screen_base(bg);
@@ -659,7 +838,7 @@ impl Engine {
                         uy = 7 - uy;
                     }
                     let idx = vram.read8(region, cb + (entry & 0x3FF) * 64 + uy * 8 + ux) as usize;
-                    (idx != 0).then(|| pal(idx))
+                    (idx != 0).then(|| pal256(entry, idx))
                 }
                 Src::Bitmap256(base) => {
                     let idx = vram.read8(region, base + ty * w as u32 + tx) as usize;

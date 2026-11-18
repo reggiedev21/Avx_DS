@@ -22,7 +22,16 @@ pub fn swi<B: Bus>(bus: &mut B, cpu: CpuId, num: u8, r: &mut [u32; 4]) -> Swi {
     match (num, cpu) {
         (0x03, _) => Swi::Handled, // WaitByLoop : le temps n'est pas consommé
         (0x04..=0x06, _) | (0x07, CpuId::Arm7) => Swi::Bios, // IntrWait, VBlankIntrWait, Halt, Sleep
-        (0x08, CpuId::Arm7) => Swi::Handled, // SoundBias
+        (0x08, CpuId::Arm7) => {
+            // SoundBias : amène SOUNDBIAS à 000h (r0 = 0) ou à 200h, par pas
+            // espacés de r1 boucles ; les bits hauts ne bougent pas
+            // (GBATEK). Le temps n'étant pas consommé ici, le niveau est posé
+            // d'un coup (SOUND_SPEC §H7).
+            let target = if r[0] == 0 { 0 } else { 0x200 };
+            let old = bus.read16(0x0400_0504);
+            bus.write16(0x0400_0504, (old & !0x3FF) | target);
+            Swi::Handled
+        }
         (0x09, _) => div(r),
         (0x0B, _) => {
             cpu_set(bus, r[0], r[1], r[2]);
@@ -53,6 +62,20 @@ pub fn swi<B: Bus>(bus: &mut B, cpu: CpuId, num: u8, r: &mut [u32; 4]) -> Swi {
         }
         (0x14, _) => {
             run_length(bus, r[0], r[1]);
+            Swi::Handled
+        }
+        // Tables du pilote son (ARM7) : GetSineTable, GetPitchTable,
+        // GetVolumeTable.
+        (0x1A, CpuId::Arm7) => {
+            r[0] = super::sound::sine_table(r[0]);
+            Swi::Handled
+        }
+        (0x1B, CpuId::Arm7) => {
+            r[0] = super::sound::pitch_table(r[0]);
+            Swi::Handled
+        }
+        (0x1C, CpuId::Arm7) => {
+            r[0] = super::sound::volume_table(r[0]);
             Swi::Handled
         }
         _ => Swi::Unhandled,
