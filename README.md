@@ -1,6 +1,6 @@
 # AvxDS
 
-Émulateur Nintendo DS écrit en Rust.
+Émulateur Nintendo DS écrit en Rust. Ca dépôt représente plus de 2 ans et demi de travail et de prise de tête.
 
 | Dossier | Contenu |
 |---|---|
