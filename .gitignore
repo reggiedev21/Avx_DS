@@ -1,0 +1,21 @@
+# Compilation
+target/
+avxds-core/Cargo.lock
+
+# Documentation de travail : privée
+JOURNAL_DEV.md
+avxds-core/docs/
+
+# ROMs, firmware, BIOS, sauvegardes et vidages : jamais versionnés
+*.nds
+!avxds-core/tests/roms/*.nds
+*.sav
+*.sav.bak
+*.bin
+!avxds-core/tests/programs/*.bin
+
+# Sorties des outils (captures, diagnostics, son enregistré)
+*.png
+*.wav
+avxds-core/gx.txt
+avxds-frontend/diag_*_rapport3d.txt
